@@ -1,0 +1,45 @@
+为什么"main 全在 sn0、target 全是 0、875 empty"
+三件事叠起来，和证据严丝合缝：
+
+vchannel 是在建 collection 时分配的：AllocVirtualChannels 按"vchannel 数最少"排序，取 N 个不同 pchannel（channel/manager.go:397-407），vchannel 名 = <pchannel>_<collID>v<idx>（funcutil.GetChannelName）。
+channel leader 必须落在 pchannel 的 WAL 所在 SN（assignChannelToWALLocatedFirstForNodeInfo）。你那次是在 sn0 已经是唯一注册的 SN（或旧元数据里 pchannel 全在 sn0）时建/载的 collection → 8 个 pchannel 全在 sn0 → 8 个 vchannel 全是 sn0 当 leader → 只有 sn0 收到 search。
+sn0 只 seed 了 shard 0，owns 只对 target==0 成立 → 只有 1/8 的 query 有人当 main → 875 empty（而且 main 行当然全是 target shard 0）。剩下 125 个 recall 也很低，是因为远端 peer 不齐/回退 native 那层。
+所以：不是 8 SN 不支持，是"8 个 vchannel 没摊到 8 个 SN 上"。而且这个顺序一旦错，改配置重启没用——vchannel 的绑定已经写进元数据了，只能清元数据重来。
+
+正确的顺序（严格按这个来，每步都有闸门）
+bash
+
+
+# ── 闸门 0：干净起点（一次性，会毁掉所有 collection）
+for p in $(ps -eo pid,args | grep 'milvus run' | grep -v grep | awk '{print $1}'); do kill -9 $p; done
+WIPE_META=1 ./recreate_middleware.sh
+
+# ── 闸门 1：先起 mixcoord，再起【全部 8 个 SN】，最后才起 datanode/proxy
+./deploy_inst2_true_dist.sh          # 脚本里已经是「mixcoord → 8×streamingnode → 2×QN(segment) → proxy」
+
+# ── 闸门 2（关键，等 balancer 把 pchannel 摊平，约 30–60 s）
+bash ~/check_8sn.sh | sed -n '/per-streamingnode/,/totals/p'
+#   期望：每个 sn_N 的 "pchannels seen" 里只有一个不同的 dml_M，8 个 SN 各不相同
+#   若全集中在 sn0 → 见下面“摊不平怎么办”，此时【绝对不要】建 collection
+闸门 2 通过之前不要 create collection。 因为 collection 一旦建了，vchannel→pchannel 的绑定就固定了。
+
+bash
+
+
+# ── 闸门 3：建 collection（8 shard / 1 replica）+ ub_inject + load
+# ── 闸门 4：打几个 query，再看
+bash ~/check_8sn.sh
+#   期望：8 个 SN 都有 main，target shard 直方图是 0..7 各一个 SN，sum(main)≈query 数
+摊不平怎么办（闸门 2 全在 sn0）：balancer 除了定时器还会在"节点变化"时触发重算（balancer_impl.go:364-394），所以：
+
+先等 60–120 s 再查一次；
+还不平就把 mixcoord 重启一次（8 个 SN 都已注册的前提下，balancer 会以 8 个节点为输入重新分配 pchannel）——重启 mixcoord 不动元数据，比重清元数据便宜；
+如果重启后仍然全在 sn0，说明 dmlChannelNum 实际不是 8（比如 16：8 个 vchannel 只用到其中 8 个 pchannel，仍可能落在少数 SN 上），此时查 etcd 的 pchannel 数（脚本第一段会打印），确认后清元数据重来。
+我那 875 empty 的推论对你有用的地方
+你不需要再跑一次来验证假设，只要在下一轮闸门 2 和闸门 4 各存一份 check_8sn.sh
+ 输出。如果闸门 2 时 pchannel 是 8 个不同 SN、闸门 4 时 main 仍只在 sn0，那才是第二个问题（比如 shardIds 或 peer handle），我再看。
+
+顺带把脚本增强了一点
+check_8sn.sh 现在每个 SN 多打印两行：pchannels seen（这一行就是闸门 2 的判据）和 vchannels seen（应该是 8 个进程各 1 个、总共 8 个）。bash -n 过。
+
+我现在唯一还缺的信息是：ub_inject + load collection 这段你们是怎么跑的（脚本还是手工命令）。把它给我，我把闸门 3 直接写进 deploy_inst2_true_dist.sh，这样从清元数据到能发 query 就是一条命令，不会再因为"少一步"重新踩一遍。
