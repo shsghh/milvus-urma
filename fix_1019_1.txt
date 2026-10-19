@@ -1,0 +1,34 @@
+三组都写完了，补丁在 ub-8rank-and-latency-fixes.patch（14 个文件，LF 换行，已用全新 worktree 验证 git apply --check 与 git apply 均通过）。
+
+一、P0：部署形状（新增 deploy_8rank_streamingnodes.sh）
+8 个 run streamingnode，每个内嵌 QN 各 seed 1 个 shard（queryNode.ub.shardIds=i），各占 1 个 vchannel → 真正 8 个 rank；
+rootCoord.dmlChannelNum=8（pchannel 与 vchannel 一一对应，否则 req_id%8 轮转会静默漏答案）；
+普通 run querynode 只做 segment 宿主，显式清空 seedDir（yaml 里的默认值会让它变成第二个 publisher，污染资源目录并双倍注册内存）；
+线程数写死（search 8 / distance 1 / read 8 / rpc 1，maxActiveQueries=8），不再让 9 个进程各自按 96 核 auto 出 ~90 线程抢同一份 cpuset；
+脚本末尾自带验收：每 SN 的 UB seed ... loadedShards=1 expectedShards=8、UB SearchEntry: main 计数分布、serving search from local readers 必须为空。
+二、P1：两处"每 query 一次"的开销
+etcd 快照缓存 — 新增 ub_resource_cache.go（+ 单测），prepareUbSearch 改走 TTL 缓存 + 后台刷新（stale-while-revalidate），首次才阻塞；激活失败时自动 Invalidate() 并重试一次，避免 load 后第一枪打到旧快照。原路径是每 query 1 次 prefix Get + 每记录 1 次 TimeToLive（8×2=16 条 → 17 次 etcd 往返）。
+nq 并发提交 — ub_search.go 从 for { UbSearchEntry(nq=1) } 串行改成按 maxActiveQueries 有界并发扇出，每个 query 保留自己的 dedupe key，主 rank 轮转语义不变。
+三、P2：读路径与串行点
+读并发上限 — read_dispatcher.cpp：Progress() 原来每轮只投 post_batch_(8) 个 READ（provider 单次上限也是 8），把 JFS depth=1024 压成 8；改成循环投递到 slot/backlog 用尽，单 lane 在途 READ 提升到 depth 量级。这是"submit→completion 400ms"最直接的作用点。
+SearchEntry 不再全程持锁 — milvus_ub_runtime.cpp：原来 state_mutex_ 包住整个 search（含 FIFO 等待），一个 QN 同时只能跑 1 个 query；现在只在"归属判定 + 快照"持锁。顺带给并发调用的 RecentReqIdSet 加了 recent_req_ids_mutex_（原本就有数据竞争）。
+全本地覆盖优先本地读 — 新增 queryNode.ub.preferLocalReaders（默认 true）+ C ABI UbSetPreferLocalReaders/UbSetMaxActiveQueries；milvus_distributed_runtime.cpp
+ 里 data_plane_ready 现在为 missing.empty() && !prefer_local，只在 1/8 覆盖的真分布式下才走 URMA。
+配置项进 milvus.yaml 与 component_param.go：maxActiveQueries: 16、resourceSnapshotTtlSeconds: 5、preferLocalReaders: true，都可单独回滚。
+四、我没法在这台机器上验证的部分（请按顺序跑）
+这台是 Windows、无 Go/C++ 工具链、无 UB 硬件，按仓库 G1/G2 我只声明"改了什么"，不声明"已经变快"。请在 950 上：
+
+bash
+
+
+git apply --check patches/ub-8rank-and-latency-fixes.patch && git apply patches/ub-8rank-and-latency-fixes.patch
+gofmt -w internal/querynodev2/server.go internal/querynodev2/ub/ub_search.go \
+         internal/querynodev2/ub_resource_cache.go internal/querynodev2/ub_resource_cache_test.go \
+         internal/util/initcore/ub_config.go pkg/util/paramtable/component_param.go   # 我这边没有 gofmt，格式请以它为准
+scripts/core_build.sh                      # 必须重建 core：新增了 2 个 C ABI 符号，Go 侧才链接得到
+make -j                                    # 重编 milvus
+go test -tags dynamic,test -gcflags="all=-N -l" -count=1 ./internal/querynodev2/ -run 'TestUbResourceCache'
+./deploy_8rank_streamingnodes.sh
+验证时按这个顺序取数，否则无法归因：① 8 个 SN 的 UB SearchEntry: main 之和 ≈ nq；② read ops/query（应仍 ≈1.3 万，量不变，变的是延迟）；③ submit→completion p50/p99（P2-1 直接作用对象）；④ 每 query etcd 往返（稳态应≈0，P1-1）；⑤ 端到端 P99。
+
+预期边界我先说清楚：这轮改动能消掉"排队"和"串行"带来的放大（400ms 里的可回收部分），但不会把 read ops/query 从 1.3 万降到 ~260 —— 那需要接 distance 下推（P2 方案 B）。所以如果 P99 只降到几十毫秒而不是 33ms，是符合预期的，下一步就是接线 RpcDistanceOracle。
