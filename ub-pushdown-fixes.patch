@@ -1,0 +1,74 @@
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
+index 889f601..cd89c38 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
+@@ -1267,6 +1267,18 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       }
+     }
+ 
++    // Resolved rpc tuning: the AutoU32 knobs live on the requested config, so
++    // resolve them here with the same defaults the runtime would pick.
++    const std::uint32_t rpc_submit_depth =
++        requested.rpc_submit_depth.automatic
++            ? static_cast<std::uint32_t>(std::max<std::uint64_t>(
++                  1U, static_cast<std::uint64_t>(meta_->M0)))
++            : requested.rpc_submit_depth.value;
++    const std::uint32_t rpc_service_depth =
++        requested.rpc_service_depth.automatic
++            ? static_cast<std::uint32_t>(std::max<std::uint64_t>(
++                  8U, static_cast<std::uint64_t>(meta_->M0)))
++            : requested.rpc_service_depth.value;
+ 
+     std::uint32_t pushdown_peers = 0;
+     if (pushdown_ready) {
+@@ -1276,10 +1288,10 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         }
+       }
+       auto rpc_distance = RpcDistanceOracle::Create(
+-          cfg->search_workers, rpc_threads, cfg->urma.rpc_submit_depth,
++          cfg->search_workers, rpc_threads, rpc_submit_depth,
+           requested.max_active_queries * meta_->M0, meta_->M0, meta_->dim,
+           local_rank, shard_to_rank, rpc_owner_by_rank,
+-          cfg->read_progress_threads, cfg->distance.use_dot_norm);
++          cfg->read_progress_threads, requested.use_dot_norm);
+       if (!rpc_distance.ok()) {
+         LOG_WARN("UB pushdown: rpc oracle unavailable ({}); staying on pull",
+                  rpc_distance.status().message());
+@@ -1294,7 +1306,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       std::vector<std::uint32_t> slots(static_cast<std::size_t>(rpc_threads),
+                                        slots_per_owner);
+       auto rpc_server = RpcServerRuntime::Create(
+-          slots, cfg->distance_workers, requested.request_ring_depth, meta_->M0,
++          slots, cfg->distance_workers, rpc_service_depth, meta_->M0,
+           local_rank, shard_to_rank, rpc_owner_by_rank,
+           requested.max_active_queries, meta_->dim, requested.request_ring_depth);
+       if (!rpc_server.ok()) {
+@@ -1362,10 +1374,12 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       }
+     }
+ 
++    DistanceOracle& pushdown_oracle =
++        pushdown_ready ? static_cast<DistanceOracle&>(*state->rpc_distance)
++                       : static_cast<DistanceOracle&>(*state->pull_distance);
+     auto hybrid = HybridDistanceOracle::Create(
+         local_shard.range().shard_id, DistancePolicy::kAuto, 4,
+-        *state->pull_distance,
+-        pushdown_ready ? *state->rpc_distance : *state->pull_distance,
++        *state->pull_distance, pushdown_oracle,
+         requested.max_active_queries * 8U);
+     if (!hybrid.ok()) {
+       return hybrid.status();
+@@ -1675,9 +1689,12 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         }
+         const auto computed = ComputeRemoteDistanceTask(
+             local_shard, distance_metric, **slot);
+-        state_ptr->rpc_server->PublishResult(
++        const auto published = state_ptr->rpc_server->PublishResult(
+             worker, *slot,
+             computed.ok() ? StatusCode::kOk : computed.code());
++        if (!published.ok()) {
++          return published;
++        }
+       }
+       return Status::Ok();
+     };
