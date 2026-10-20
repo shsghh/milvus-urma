@@ -1,27 +1,51 @@
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
-index 889f601..cd89c38 100644
+index 889f601..e9d0dc2 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
-@@ -1267,6 +1267,18 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -326,12 +326,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+            peer_data.size(), missing_remote_shards.size(), data_plane_ready);
+ 
+ 
+-  // Distance data plane. Pushdown is requested by default; it only becomes
+-  // effective after every peer mailbox segment (task/result/notify) is imported.
+-  // Until that import path is wired this stays on pull, so leaving the switch on
+-  // is safe. See docs/design_docs/ub-pushdown-design.md.
+-  LOG_INFO("UB data plane: pushdown_requested={} effective=pull (peer mailboxes not imported yet)",
+-           knobs_.pushdown);
+ 
+   if (!data_plane_ready) {
+     LOG_WARN(
+@@ -1243,12 +1237,15 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+     // rpc owner of a rank is rank % rpc_threads, both here and in the peer's
+     // own transport creation, which keeps the mapping symmetric.
+     const std::uint32_t rpc_threads = cfg->rpc_progress_threads;
++    // shard i is served by rank i; the rpc owner map comes from the resolver
++    // (BuildCommunicationOwnerMap), not from an ad-hoc formula: the peer side
++    // routes its writes through the same map, so both must agree.
+     std::vector<std::uint32_t> shard_to_rank(world_size);
+-    std::vector<std::uint32_t> rpc_owner_by_rank(world_size);
+     for (std::uint32_t rank = 0; rank < world_size; ++rank) {
+       shard_to_rank[rank] = rank;
+-      rpc_owner_by_rank[rank] = rank % rpc_threads;
+     }
++    const std::span<const std::uint32_t> rpc_owner_by_rank =
++        cfg->owners.rpc_owner_by_rank;
+ 
+     bool pushdown_ready = knobs_.pushdown && state->rpc_memory != nullptr;
+     if (pushdown_ready) {
+@@ -1267,6 +1264,11 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        }
      }
  
-+    // Resolved rpc tuning: the AutoU32 knobs live on the requested config, so
-+    // resolve them here with the same defaults the runtime would pick.
-+    const std::uint32_t rpc_submit_depth =
-+        requested.rpc_submit_depth.automatic
-+            ? static_cast<std::uint32_t>(std::max<std::uint64_t>(
-+                  1U, static_cast<std::uint64_t>(meta_->M0)))
-+            : requested.rpc_submit_depth.value;
-+    const std::uint32_t rpc_service_depth =
-+        requested.rpc_service_depth.automatic
-+            ? static_cast<std::uint32_t>(std::max<std::uint64_t>(
-+                  8U, static_cast<std::uint64_t>(meta_->M0)))
-+            : requested.rpc_service_depth.value;
++    // Consume the resolved queue depths. Recomputing them from M0 here would
++    // duplicate ResolveRuntimeConfig's formula and silently disagree with what
++    // the transport and the remote side expect.
++    const std::uint32_t rpc_submit_depth = cfg->queues.depths.rpc_submit;
++    const std::uint32_t rpc_service_depth = cfg->queues.depths.service;
  
      std::uint32_t pushdown_peers = 0;
      if (pushdown_ready) {
-@@ -1276,10 +1288,10 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1276,10 +1278,10 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          }
        }
        auto rpc_distance = RpcDistanceOracle::Create(
@@ -34,16 +58,46 @@ index 889f601..cd89c38 100644
        if (!rpc_distance.ok()) {
          LOG_WARN("UB pushdown: rpc oracle unavailable ({}); staying on pull",
                   rpc_distance.status().message());
-@@ -1294,7 +1306,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
-       std::vector<std::uint32_t> slots(static_cast<std::size_t>(rpc_threads),
-                                        slots_per_owner);
+@@ -1289,14 +1291,17 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       }
+     }
+     if (pushdown_ready) {
+-      const std::uint32_t slots_per_owner =
+-          static_cast<std::uint32_t>(meta_->M0) * 8U;
+-      std::vector<std::uint32_t> slots(static_cast<std::size_t>(rpc_threads),
+-                                       slots_per_owner);
++      std::vector<std::uint32_t> slots;
++      slots.reserve(cfg->remote_tasks.owners.size());
++      for (const auto& owner_capacity : cfg->remote_tasks.owners) {
++        slots.push_back(static_cast<std::uint32_t>(
++            owner_capacity.actual_remote_task_slots));
++      }
        auto rpc_server = RpcServerRuntime::Create(
 -          slots, cfg->distance_workers, requested.request_ring_depth, meta_->M0,
 +          slots, cfg->distance_workers, rpc_service_depth, meta_->M0,
            local_rank, shard_to_rank, rpc_owner_by_rank,
-           requested.max_active_queries, meta_->dim, requested.request_ring_depth);
+-          requested.max_active_queries, meta_->dim, requested.request_ring_depth);
++          cfg->query_cache_entries, meta_->dim, requested.request_ring_depth,
++          cfg->query_cache_entries_per_owner);
        if (!rpc_server.ok()) {
-@@ -1362,10 +1374,12 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         LOG_WARN("UB pushdown: rpc server unavailable ({}); staying on pull",
+                  rpc_server.status().message());
+@@ -1319,12 +1324,8 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         }
+         state->rpc_clients.push_back(std::move(client).value());
+ 
+-        std::vector<std::uint32_t> owned;
+-        for (std::uint32_t rank = 0; rank < world_size; ++rank) {
+-          if (rpc_owner_by_rank[rank] == owner) {
+-            owned.push_back(rank);
+-          }
+-        }
++        const std::span<const std::uint32_t> owned =
++            cfg->owners.rpc_owned_ranks[owner];
+         RpcTransportConfig transport_config;
+         transport_config.owner_thread = owner;
+         transport_config.transport_lane = cfg->read_progress_threads + owner;
+@@ -1362,10 +1363,12 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        }
      }
  
@@ -58,7 +112,7 @@ index 889f601..cd89c38 100644
          requested.max_active_queries * 8U);
      if (!hybrid.ok()) {
        return hybrid.status();
-@@ -1675,9 +1689,12 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1675,9 +1678,12 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          }
          const auto computed = ComputeRemoteDistanceTask(
              local_shard, distance_metric, **slot);
