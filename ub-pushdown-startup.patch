@@ -1,0 +1,590 @@
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
+index 4c1e2c8..3800c30 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
+@@ -188,6 +188,14 @@ class MilvusUbRuntime {
+   // control thread consumes completions and applies deadlines instead of
+   // walking a fixed query list.
+   Status EnableDistributedSearch();
++  // Idempotent: builds the distance-pushdown data plane once every peer has
++  // published its rpc mailbox rings. Returns kUnavailable while not ready, so
++  // callers can retry (the rings are published after enable).
++  Status TryEnablePushdown();
++  // True once EnableDistributedSearch installed the data plane.
++  bool DistributedEnabled();
++  // Same, assuming state_mutex_ is already held.
++  Status EnablePushdownLocked(DistributedState& state);
+ 
+   // B-test diagnostic: PostReads 5 different offsets through lane engine 0
+   // from the calling thread, AFTER EnableDistributedSearch has returned.
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
+index 4df14d5..3707727 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
+@@ -36,6 +36,7 @@
+ namespace hnsw_urma {
+ 
+ class RpcServerRuntime;
++class LocalShard;
+ 
+ // Pimpl holding every object the 5 thread classes share. Built once by
+ // EnableDistributedSearchLocked(); owned by MilvusUbRuntime and destroyed
+@@ -134,6 +135,15 @@ struct MilvusUbRuntime::DistributedState {
+   std::vector<std::unique_ptr<RpcClientOwner>> rpc_clients;
+   std::vector<std::unique_ptr<RpcTransportOwner>> rpc_transports;
+ 
++  // Captured by EnableDistributedSearchLocked so the pushdown path can be
++  // (re)built later: the mailbox rings only exist after enable, so a peer's
++  // mailbox records arrive only after this node already enabled.
++  const LocalShard* local_shard{nullptr};
++  std::uint32_t request_ring_depth{8};
++  bool use_dot_norm{false};
++  bool profile{false};
++  bool pushdown_active{false};
++
+   std::mutex fifo_mutex;
+   std::condition_variable fifo_cv;
+   std::deque<PendingQuery> fifo;
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
+index e2300c1..d760449 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
+@@ -173,6 +173,13 @@ int UbGetEntryShard(uint32_t* out_entry_shard_id);
+ // Returns 0 on success, non-zero hnsw_urma StatusCode on failure.
+ int UbEnableDistributedSearch(void);
+ 
++// Returns 1 when the distance-pushdown data plane is active, 0 while it is
++// still waiting for the peer mailbox rings (call again), < 0 on error.
++int UbTryEnablePushdown(void);
++
++// 1 once the distributed data plane is installed, else 0.
++int UbDistributedEnabled(void);
++
+ // Post-EnableDistributedSearch: returns the jfr_id (24 bytes) of the bundle's
+ // lane-0 read_target_jfr — the JFR that this process's read_progress thread
+ // actually polls for incoming READ WRs. The Go layer must re-publish the
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
+index 3d472a4..0bc5459 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
+@@ -328,11 +328,16 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+ 
+ 
+   if (!data_plane_ready) {
++    // Startup order: the peers' shard resources are not published yet. Do not
++    // install a degraded data plane (local readers would answer only the local
++    // shard and every other query would come back empty); report "deferred" so
++    // the caller retries after the directory fills up.
+     LOG_WARN(
+         "UB distributed runtime: URMA data plane deferred; missing graph+"
+-        "vector handles for {} shards (peers not fully activated). Falling "
+-        "back to local readers until all remote shards are imported.",
++        "vector handles for {} shards (peers not published yet). Retry later.",
+         missing_remote_shards.size());
++    return Status(StatusCode::kUnavailable,
++                  "UB data plane deferred: peer shards not published yet");
+   }
+ 
+   if (data_plane_ready) {
+@@ -1232,153 +1237,28 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+     }
+     state->pull_distance.emplace(std::move(pull).value());
+ 
+-    // ---- distance pushdown -------------------------------------------------
+-    // shard i is served by rank i, so the shard->rank map is the identity. The
+-    // rpc owner of a rank is rank % rpc_threads, both here and in the peer's
+-    // own transport creation, which keeps the mapping symmetric.
+-    const std::uint32_t rpc_threads = cfg->rpc_progress_threads;
+-    std::vector<std::uint32_t> shard_to_rank(world_size);
+-    std::vector<std::uint32_t> rpc_owner_by_rank(world_size);
+-    for (std::uint32_t rank = 0; rank < world_size; ++rank) {
+-      shard_to_rank[rank] = rank;
+-      rpc_owner_by_rank[rank] = rank % rpc_threads;
+-    }
+-
+-    bool pushdown_ready = knobs_.pushdown && state->rpc_memory != nullptr;
+-    if (pushdown_ready) {
+-      std::lock_guard<std::mutex> guard(state_mutex_);
+-      for (std::uint32_t rank = 0; rank < world_size && pushdown_ready; ++rank) {
+-        if (rank == local_rank) {
+-          continue;
+-        }
+-        for (std::uint32_t role = 2; role <= 4; ++role) {
+-          if (peer_handles_.find({static_cast<shard_id_t>(rank), role}) ==
+-              peer_handles_.end()) {
+-            pushdown_ready = false;
+-            break;
+-          }
+-        }
+-      }
+-    }
+-
+-    const std::uint32_t rpc_submit_depth =
+-        requested.rpc_submit_depth.automatic
+-            ? static_cast<std::uint32_t>(std::max<std::uint64_t>(
+-                  1U, static_cast<std::uint64_t>(meta_->M0)))
+-            : requested.rpc_submit_depth.value;
+-    const std::uint32_t rpc_service_depth =
+-        requested.rpc_service_depth.automatic
+-            ? static_cast<std::uint32_t>(std::max<std::uint64_t>(
+-                  8U, static_cast<std::uint64_t>(meta_->M0)))
+-            : requested.rpc_service_depth.value;
+-
+-    std::uint32_t pushdown_peers = 0;
+-    if (pushdown_ready) {
+-      for (std::uint32_t rank = 0; rank < world_size; ++rank) {
+-        if (rank != local_rank) {
+-          ++pushdown_peers;
+-        }
+-      }
+-      auto rpc_distance = RpcDistanceOracle::Create(
+-          cfg->search_workers, rpc_threads, rpc_submit_depth,
+-          requested.max_active_queries * meta_->M0, meta_->M0, meta_->dim,
+-          local_rank, shard_to_rank, rpc_owner_by_rank,
+-          cfg->read_progress_threads, requested.use_dot_norm);
+-      if (!rpc_distance.ok()) {
+-        LOG_WARN("UB pushdown: rpc oracle unavailable ({}); staying on pull",
+-                 rpc_distance.status().message());
+-        pushdown_ready = false;
+-      } else {
+-        state->rpc_distance = std::move(rpc_distance).value();
+-      }
+-    }
+-    if (pushdown_ready) {
+-      const std::uint32_t slots_per_owner =
+-          static_cast<std::uint32_t>(meta_->M0) * 8U;
+-      std::vector<std::uint32_t> slots(static_cast<std::size_t>(rpc_threads),
+-                                       slots_per_owner);
+-      auto rpc_server = RpcServerRuntime::Create(
+-          slots, cfg->distance_workers, rpc_service_depth, meta_->M0,
+-          local_rank, shard_to_rank, rpc_owner_by_rank,
+-          requested.max_active_queries, meta_->dim, requested.request_ring_depth);
+-      if (!rpc_server.ok()) {
+-        LOG_WARN("UB pushdown: rpc server unavailable ({}); staying on pull",
+-                 rpc_server.status().message());
+-        pushdown_ready = false;
+-      } else {
+-        state->rpc_server = std::move(rpc_server).value();
+-      }
+-    }
+-    if (pushdown_ready) {
+-      for (std::uint32_t owner = 0; owner < rpc_threads; ++owner) {
+-        auto client = RpcClientOwner::Create(
+-            owner, world_size, requested.max_active_queries * meta_->M0,
+-            state->rpc_distance->submissions(), requested.max_active_queries,
+-            requested.profile, state->rpc_distance.get());
+-        if (!client.ok()) {
+-          LOG_WARN("UB pushdown: rpc client {} unavailable ({}); staying on pull",
+-                   owner, client.status().message());
+-          pushdown_ready = false;
+-          break;
+-        }
+-        state->rpc_clients.push_back(std::move(client).value());
+-
+-        std::vector<std::uint32_t> owned;
+-        for (std::uint32_t rank = 0; rank < world_size; ++rank) {
+-          if (rpc_owner_by_rank[rank] == owner) {
+-            owned.push_back(rank);
+-          }
+-        }
+-        RpcTransportConfig transport_config;
+-        transport_config.owner_thread = owner;
+-        transport_config.transport_lane = cfg->read_progress_threads + owner;
+-        transport_config.local_rank = local_rank;
+-        transport_config.request_batch_max_tasks =
+-            cfg->rpc_request_batch_max_tasks;
+-        transport_config.request_batch_max_bytes =
+-            cfg->rpc_request_batch_max_bytes;
+-        transport_config.response_batch_max_tasks =
+-            cfg->rpc_response_batch_max_tasks;
+-        transport_config.response_batch_max_bytes =
+-            cfg->rpc_response_batch_max_bytes;
+-        transport_config.profiling_enabled = requested.profile;
+-        if (transport_config.transport_lane >= state->engines.size() ||
+-            !state->engines[transport_config.transport_lane]) {
+-          LOG_WARN("UB pushdown: rpc lane engine missing; staying on pull");
+-          pushdown_ready = false;
+-          break;
+-        }
+-        auto transport = RpcTransportOwner::Create(
+-            transport_config, owned,
+-            *state->engines[transport_config.transport_lane], *state->backend,
+-            *state->rpc_memory, *state->rpc_clients.back(),
+-            *state->rpc_server);
+-        if (!transport.ok()) {
+-          LOG_WARN("UB pushdown: rpc transport {} unavailable ({}); staying on pull",
+-                   owner, transport.status().message());
+-          pushdown_ready = false;
+-          break;
+-        }
+-        state->rpc_transports.push_back(std::move(transport).value());
+-      }
+-      if (pushdown_ready && state->rpc_transports.size() != rpc_threads) {
+-        pushdown_ready = false;
+-      }
+-    }
++    // Distance pushdown state: captured here so TryEnablePushdown() can build
++    // the rpc data plane later, when the peers' mailbox rings show up (they are
++    // published only after each peer enabled, i.e. possibly after this node).
++    state->local_shard = &local_shard;
++    state->request_ring_depth = requested.request_ring_depth;
++    state->use_dot_norm = requested.use_dot_norm;
++    state->profile = requested.profile;
+ 
+-    DistanceOracle& pushdown_oracle =
+-        pushdown_ready ? static_cast<DistanceOracle&>(*state->rpc_distance)
+-                       : static_cast<DistanceOracle&>(*state->pull_distance);
+     auto hybrid = HybridDistanceOracle::Create(
+         local_shard.range().shard_id, DistancePolicy::kAuto, 4,
+-        *state->pull_distance, pushdown_oracle,
++        *state->pull_distance, *state->pull_distance,
+         requested.max_active_queries * 8U);
+     if (!hybrid.ok()) {
+       return hybrid.status();
+     }
+     state->hybrid_distance = std::move(hybrid).value();
+-    LOG_INFO("UB data plane: pushdown={} peers={} rpc_threads={}",
+-             pushdown_ready, pushdown_peers, rpc_threads);
++
++    const auto pushdown = EnablePushdownLocked(*state);
++    if (!pushdown.ok()) {
++      LOG_INFO("UB data plane: pull (pushdown deferred: {})",
++               pushdown.message());
++    }
+ 
+     LOG_INFO("UB distributed runtime: URMA data plane active (graph+vectors "
+              "via peer segment table, {} remote shards)",
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
+index 69e7c13..cb2d3d3 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "hnsw_urma/milvus_ub_runtime.hpp"
+ #include "hnsw_urma/milvus_ub_runtime_impl.hpp"
++#include "hnsw_urma/runtime/rpc_runtime.hpp"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -597,3 +598,148 @@ Metric MilvusUbRuntime_MetricFromName(const char* name) {
+ }
+ 
+ }  // namespace hnsw_urma
++
++// Builds the distance-pushdown data plane. Called once at the end of
++// EnableDistributedSearchLocked and again, on demand, from TryEnablePushdown():
++// the rpc mailbox rings are allocated with the data plane, so a peer can only
++// publish its rings after it enabled, which is after this node may have
++// enabled. Hence the retry path.
++Status MilvusUbRuntime::EnablePushdownLocked(DistributedState& state) {
++  if (state.pushdown_active) {
++    return Status::Ok();
++  }
++  if (!knobs_.pushdown || !state.rpc_memory || !state.backend ||
++      state.local_shard == nullptr || !state.effective || meta_ == nullptr ||
++      state.engines.empty()) {
++    return Status(StatusCode::kUnavailable, "pushdown prerequisites missing");
++  }
++  const auto& cfg = *state.effective;
++  const std::uint32_t rpc_threads = cfg.rpc_progress_threads;
++  if (rpc_threads == 0 ||
++      state.engines.size() <
++          static_cast<std::size_t>(cfg.read_progress_threads) + rpc_threads) {
++    return Status(StatusCode::kUnavailable, "pushdown rpc lanes missing");
++  }
++  // Every remote rank must have published its three mailbox rings (roles 2..4).
++  for (std::uint32_t rank = 0; rank < state.world_size; ++rank) {
++    if (rank == state.local_rank) {
++      continue;
++    }
++    for (std::uint32_t role = 2; role <= 4; ++role) {
++      if (peer_handles_.find({static_cast<shard_id_t>(rank), role}) ==
++          peer_handles_.end()) {
++        return Status(StatusCode::kUnavailable,
++                      "peer rpc mailbox not imported yet");
++      }
++    }
++  }
++  // Replacing the oracle invalidates every reference held by an in-flight
++  // search, so only swap when the FIFO is empty.
++  if (state.active_queries != 0) {
++    return Status(StatusCode::kUnavailable, "queries in flight");
++  }
++
++  std::vector<std::uint32_t> shard_to_rank(state.world_size);
++  std::vector<std::uint32_t> rpc_owner_by_rank(state.world_size);
++  for (std::uint32_t rank = 0; rank < state.world_size; ++rank) {
++    shard_to_rank[rank] = rank;  // shard i is served by rank i
++    rpc_owner_by_rank[rank] = rank % rpc_threads;
++  }
++  const std::uint32_t max_ids = static_cast<std::uint32_t>(meta_->M0);
++
++  auto rpc_distance = RpcDistanceOracle::Create(
++      cfg.search_workers, rpc_threads, cfg.queues.depths.rpc_submit,
++      state.max_active_queries * max_ids, max_ids, meta_->dim, state.local_rank,
++      shard_to_rank, rpc_owner_by_rank, cfg.read_progress_threads,
++      state.use_dot_norm);
++  if (!rpc_distance.ok()) {
++    return rpc_distance.status();
++  }
++  state.rpc_distance = std::move(rpc_distance).value();
++
++  std::vector<std::uint32_t> slots;
++  slots.reserve(cfg.remote_tasks.owners.size());
++  for (const auto& owner_capacity : cfg.remote_tasks.owners) {
++    slots.push_back(
++        static_cast<std::uint32_t>(owner_capacity.actual_remote_task_slots));
++  }
++  auto rpc_server = RpcServerRuntime::Create(
++      slots, cfg.distance_workers, cfg.queues.depths.service, max_ids,
++      state.local_rank, shard_to_rank, rpc_owner_by_rank,
++      cfg.query_cache_entries, meta_->dim, state.request_ring_depth,
++      cfg.query_cache_entries_per_owner);
++  if (!rpc_server.ok()) {
++    return rpc_server.status();
++  }
++  state.rpc_server = std::move(rpc_server).value();
++
++  for (std::uint32_t owner = 0; owner < rpc_threads; ++owner) {
++    auto client = RpcClientOwner::Create(
++        owner, state.world_size, state.max_active_queries * max_ids,
++        state.rpc_distance->submissions(), state.max_active_queries,
++        state.profile, state.rpc_distance.get());
++    if (!client.ok()) {
++      return client.status();
++    }
++    state.rpc_clients.push_back(std::move(client).value());
++
++    std::vector<std::uint32_t> owned;
++    for (std::uint32_t rank = 0; rank < state.world_size; ++rank) {
++      if (rpc_owner_by_rank[rank] == owner) {
++        owned.push_back(rank);
++      }
++    }
++    RpcTransportConfig transport_config;
++    transport_config.owner_thread = owner;
++    transport_config.transport_lane = cfg.read_progress_threads + owner;
++    transport_config.local_rank = state.local_rank;
++    transport_config.request_batch_max_tasks =
++        cfg.rpc_request_batch_max_tasks;
++    transport_config.request_batch_max_bytes =
++        cfg.rpc_request_batch_max_bytes;
++    transport_config.response_batch_max_tasks =
++        cfg.rpc_response_batch_max_tasks;
++    transport_config.response_batch_max_bytes =
++        cfg.rpc_response_batch_max_bytes;
++    transport_config.profiling_enabled = state.profile;
++    const std::size_t lane = transport_config.transport_lane;
++    if (lane >= state.engines.size() || !state.engines[lane]) {
++      return Status(StatusCode::kUnavailable,
++                    "pushdown rpc lane engine missing");
++    }
++    auto transport = RpcTransportOwner::Create(
++        transport_config, owned, *state.engines[lane], *state.backend,
++        *state.rpc_memory, *state.rpc_clients.back(), *state.rpc_server);
++    if (!transport.ok()) {
++      return transport.status();
++    }
++    state.rpc_transports.push_back(std::move(transport).value());
++  }
++
++  auto hybrid = HybridDistanceOracle::Create(
++      state.local_shard->range().shard_id, DistancePolicy::kAuto, 4,
++      *state.pull_distance, *state.rpc_distance,
++      state.max_active_queries * 8U);
++  if (!hybrid.ok()) {
++    return hybrid.status();
++  }
++  state.hybrid_distance = std::move(hybrid).value();
++  state.pushdown_active = true;
++  LOG_INFO("UB pushdown enabled: peers={} rpc_threads={}",
++           state.world_size - 1, rpc_threads);
++  return Status::Ok();
++}
++
++Status MilvusUbRuntime::TryEnablePushdown() {
++  std::lock_guard<std::mutex> lock(state_mutex_);
++  if (!distributed_runtime_) {
++    return Status(StatusCode::kUnavailable,
++                  "distributed runtime not enabled");
++  }
++  return EnablePushdownLocked(*distributed_runtime_);
++}
++
++bool MilvusUbRuntime::DistributedEnabled() {
++  std::lock_guard<std::mutex> lock(state_mutex_);
++  return distributed_runtime_ != nullptr;
++}
+\ No newline at end of file
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
+index 784b193..e0fcf22 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
+@@ -372,10 +372,29 @@ int UbGetEntryShard(uint32_t* out_entry_shard_id) {
+ 
+ int UbEnableDistributedSearch(void) {
+   auto st = hnsw_urma::MilvusUbRuntime::Instance().EnableDistributedSearch();
++  if (st.code() == hnsw_urma::StatusCode::kUnavailable) {
++    // Peer shard resources are not published yet: retryable, not fatal.
++    return 2;
++  }
+   return st.ok() ? static_cast<int>(hnsw_urma::StatusCode::kOk)
+                  : static_cast<int>(st.code());
+ }
+ 
++int UbDistributedEnabled(void) {
++  return hnsw_urma::MilvusUbRuntime::Instance().DistributedEnabled() ? 1 : 0;
++}
++
++int UbTryEnablePushdown(void) {
++  auto st = hnsw_urma::MilvusUbRuntime::Instance().TryEnablePushdown();
++  if (st.ok()) {
++    return 1;
++  }
++  if (st.code() == hnsw_urma::StatusCode::kUnavailable) {
++    return 0;
++  }
++  return -static_cast<int>(st.code());
++}
++
+ // B-test: probe PostReads on the cgo main OS thread after enable returns.
+ // Caller (Go) must runtime.LockOSThread around both enable and this probe.
+ int UbProbePostReadsOnEnableThread(void) {
+diff --git a/internal/querynodev2/server.go b/internal/querynodev2/server.go
+index d803b0e..6e1dc52 100644
+--- a/internal/querynodev2/server.go
++++ b/internal/querynodev2/server.go
+@@ -222,6 +222,10 @@ func (node *QueryNode) Register() error {
+ 	// and lease are ready. The UB runtime was seeded during Init, so the
+ 	// shard memory layout is already final here.
+ 	node.publishUbShardResources(node.ctx)
++	// Bring the distributed data plane up from the startup path. Waiting for
++	// the first search means only the nodes that happen to receive queries
++	// ever enable, so peers never see each other's mailbox rings.
++	node.startUbPushdownBootstrap(node.ctx)
+ 	// start liveness check
+ 	metrics.NumNodes.WithLabelValues(fmt.Sprint(node.GetNodeID()), typeutil.QueryNodeRole).Inc()
+ 	return nil
+@@ -1074,6 +1078,56 @@ func (node *QueryNode) initUrma() error {
+ // queue roles need runtime queue buffers that first exist in the T5
+ // topology (M-5). Publish must happen after UbSeedFromDir/UbLoadShard so
+ // the memory layout is final.
++// startUbPushdownBootstrap drives the distributed / pushdown bring-up from the
++// startup path. Every streaming node must publish its own resources and enable
++// its data plane; otherwise only the nodes that happen to receive a query
++// participate, the peers' mailbox rings never get imported, and pushdown stays
++// off forever.
++func (node *QueryNode) startUbPushdownBootstrap(ctx context.Context) {
++	if !paramtable.Get().QueryNodeCfg.UbEnabled.GetAsBool() {
++		return
++	}
++	go func() {
++		ticker := time.NewTicker(time.Second)
++		defer ticker.Stop()
++		enabled := false
++		published := false
++		for {
++			select {
++			case <-ctx.Done():
++				return
++			case <-ticker.C:
++			}
++			if !enabled {
++				if err := node.prepareUbSearch(ctx); err != nil &&
++					!errors.Is(err, initcore.ErrUbPushdownDeferred) {
++					mlog.Warn(ctx, "UB bootstrap: enable failed", mlog.Err(err))
++					continue
++				}
++				// prepareUbSearch swallows the deferred case so searches keep
++				// working, so ask the runtime directly.
++				if initcore.UbDistributedEnabled() {
++					enabled = true
++					mlog.Info(ctx, "UB bootstrap: distributed runtime enabled")
++				}
++				continue
++			}
++			if !published {
++				node.publishUbRpcMailboxes(ctx)
++				published = true
++			}
++			ready, err := initcore.UbTryEnablePushdown()
++			if err != nil {
++				mlog.Warn(ctx, "UB bootstrap: pushdown enable failed", mlog.Err(err))
++				continue
++			}
++			if ready {
++				mlog.Info(ctx, "UB bootstrap: distance pushdown active")
++				return
++			}
++		}
++	}()
++}
+ func (node *QueryNode) publishUbShardResources(ctx context.Context) {
+ 	if !paramtable.Get().QueryNodeCfg.UbEnabled.GetAsBool() {
+ 		return
+@@ -1185,6 +1239,12 @@ func (node *QueryNode) prepareUbSearch(ctx context.Context) error {
+ 	// full-seed deployment this also starts the scheduler path; it is
+ 	// idempotent on the C++ side.
+ 	if err := initcore.UbEnableDistributedSearch(); err != nil {
++		if errors.Is(err, initcore.ErrUbPushdownDeferred) {
++			// Startup order: this node is ready before its peers published
++			// their shard resources. The bootstrap ticker retries.
++			mlog.Info(ctx, "UB distributed runtime deferred until peers publish their shards")
++			return nil
++		}
+ 		return err
+ 	}
+ 	// The RPC mailbox rings only exist once the distributed runtime is
+diff --git a/internal/util/initcore/init_core.go b/internal/util/initcore/init_core.go
+index bf1c035..d1684f9 100644
+--- a/internal/util/initcore/init_core.go
++++ b/internal/util/initcore/init_core.go
+@@ -33,6 +33,7 @@ import "C"
+ import (
+ 	"context"
+ 	"encoding/base64"
++	"errors"
+ 	"fmt"
+ 	"os"
+ 	"runtime"
+@@ -970,6 +971,28 @@ func RemoveUbPeerHandles(shardID uint32, role uint32) {
+ // B-test: LockOSThread so the cgo main OS thread that ran enable is the
+ // same thread that runs UbProbePostReadsOnEnableThread afterwards.
+ // Diagnostic gated on env UB_PROBE_ON_ENABLE_THREAD=1.
++// ErrUbPushdownDeferred means the distributed runtime could not be built yet
++// because the peers have not published their shard resources. It is retryable.
++var ErrUbPushdownDeferred = errors.New("ub distributed runtime deferred")
++
++// UbDistributedEnabled reports whether the distributed data plane is installed.
++func UbDistributedEnabled() bool {
++	return C.UbDistributedEnabled() == 1
++}
++
++// UbTryEnablePushdown asks the runtime to build the distance-pushdown data
++// plane. The rpc mailbox rings exist only after enable, so a peer publishes them
++// after its own enable; that makes this a poll: ready=false means "try again".
++func UbTryEnablePushdown() (bool, error) {
++	ret := C.UbTryEnablePushdown()
++	if ret == 1 {
++		return true, nil
++	}
++	if ret == 0 {
++		return false, nil
++	}
++	return false, fmt.Errorf("UbTryEnablePushdown failed with status %d", int(ret))
++}
+ func UbEnableDistributedSearch() error {
+ 	lockThread := os.Getenv("UB_PROBE_ON_ENABLE_THREAD") != ""
+ 	if lockThread {
+@@ -979,6 +1002,11 @@ func UbEnableDistributedSearch() error {
+ 	fmt.Fprintf(os.Stderr, "[UBCGO] BEFORE cgo ts=%d pid=%d\n", time.Now().UnixNano(), os.Getpid())
+ 	ret := C.UbEnableDistributedSearch()
+ 	fmt.Fprintf(os.Stderr, "[UBCGO] AFTER  cgo ts=%d pid=%d\n", time.Now().UnixNano(), os.Getpid())
++	if ret == 2 {
++		// Startup order: the peers have not published their shard resources
++		// yet. The caller retries; this is not an error.
++		return ErrUbPushdownDeferred
++	}
+ 	if ret != 0 {
+ 		return fmt.Errorf("UbEnableDistributedSearch failed with status %d", int(ret))
+ 	}
