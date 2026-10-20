@@ -1,0 +1,1103 @@
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
+index c81cb1c..f928cca 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
+@@ -212,6 +212,13 @@ class MilvusUbRuntime {
+     std::string progress_mode{"busy"};
+     std::vector<std::uint32_t> allowed_cpus;
+     std::string urma_device;
++    // max_active_queries == 0 keeps the RuntimeConfig default. Sized before
++    // EnableDistributedSearch: it determines the slot pool and per-slot scratch.
++    std::uint32_t max_active_queries{0};
++    // A rank that holds every shard serves searches inline from its local
++    // readers instead of starting the thread group (URMA cannot serve that
++    // case: the local readers do not implement prepared waits).
++    bool prefer_local_readers{true};
+   };
+ 
+   // Returns a snapshot of the staged knobs (thread-safe). Values are those
+@@ -271,6 +278,11 @@ class MilvusUbRuntime {
+ 
+   // M-5: scheduler-backed runtime; null until EnableDistributedSearch.
+   std::unique_ptr<DistributedState> distributed_runtime_;
++
++  // Set when this rank holds every shard and serves searches inline from the
++  // local readers (no thread group). Keeps EnableDistributedSearch idempotent
++  // so prepareUbSearch, which runs on every search, does not rebuild state.
++  bool inline_local_only_{false};
+ };
+ 
+ }  // namespace hnsw_urma
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/search/local_io.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/search/local_io.hpp
+index 929c2d1..052e6c4 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/search/local_io.hpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/search/local_io.hpp
+@@ -10,6 +10,11 @@
+ 
+ namespace hnsw_urma {
+ 
++// Ticket values are opaque handles for the caller: both local readers ignore
++// them in Poll()/Finish(). They are therefore produced from a process-wide
++// atomic counter in local_io.cpp rather than from a member, so that these
++// classes stay trivially copyable/movable (Result<T> returns them by value and
++// HnswSearchTask/EnsureReadersBuilt move them).
+ class LocalGraphReader final : public GraphReader {
+  public:
+   [[nodiscard]] static Result<LocalGraphReader> Create(
+@@ -25,7 +30,6 @@ class LocalGraphReader final : public GraphReader {
+   const ShardMap* shard_map_{nullptr};
+   const UpperGraphReplica* upper_{nullptr};
+   std::vector<const LocalShard*> shards_;
+-  ticket_t next_ticket_{1};
+ };
+ 
+ class LocalDistanceOracle final : public DistanceOracle {
+@@ -61,7 +65,6 @@ class LocalDistanceOracle final : public DistanceOracle {
+   Metric metric_{Metric::kL2};
+   DistanceImplementation implementation_{DistanceImplementation::kAuto};
+   bool use_dot_norm_{false};
+-  ticket_t next_ticket_{1};
+ };
+ 
+ }  // namespace hnsw_urma
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
+index af2fe5e..42e508c 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
+@@ -187,6 +187,17 @@ int UbGetLocalReadTargetJfrId(uint8_t* out_descriptor);
+ // itself (B fails). Prints "[UB ProbeOnEnableThread]" diagnostics. Returns 0.
+ int UbProbePostReadsOnEnableThread(void);
+ 
++// Stage the distributed runtime bounds. 0 keeps the runtime default. Must be
++// called before UbEnableDistributedSearch: the value sizes the query slot pool
++// and the per-slot scratch.
++void UbSetMaxActiveQueries(uint32_t max_active_queries);
++
++// A QueryNode that seeded every shard locally can answer search from its own
++// readers (inline, no thread group) instead of issuing URMA READs against its
++// own memory. enable != 0 (default) prefers that path; 0 forces the URMA data
++// plane, which is only useful for A/B measurements.
++void UbSetPreferLocalReaders(int enable);
++
+ #ifdef __cplusplus
+ }  // extern "C"
+ #endif
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
+index 9abeca9..32640c3 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
+@@ -112,7 +112,7 @@ static void UbDumpUrmaState(const char* label,
+                             urma_jfc_t* read_jfc);
+ 
+ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+-  if (distributed_runtime_) {
++  if (distributed_runtime_ || inline_local_only_) {
+     return Status::Ok();
+   }
+   if (!meta_ || !shard_map_ || local_shards_.empty()) {
+@@ -152,6 +152,10 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       requested.rpc_progress_threads.value = k.rpc_progress_workers;
+       requested.rpc_progress_threads.automatic = false;
+     }
++    // Must be staged before the slot pool and per-slot scratch are sized.
++    if (k.max_active_queries != 0) {
++      requested.max_active_queries = k.max_active_queries;
++    }
+     requested.urma_device = k.urma_device;
+   }
+ 
+@@ -183,6 +187,21 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         local_shards_.size(), shard_map_->ranges().size());
+   }
+ 
++  // A QN that already holds every shard would otherwise read its own memory
++  // back over URMA. The thread-group path cannot serve that case (it requires
++  // the readers to implement prepared waits), so serve it inline instead.
++  const bool prefer_local_readers =
++      full_local_coverage && knobs_.prefer_local_readers;
++  if (prefer_local_readers) {
++    inline_local_only_ = true;
++    LOG_INFO(
++        "UB distributed runtime: full local coverage ({}/{} shards); serving "
++        "search inline from local readers, thread group NOT started "
++        "(queryNode.ub.preferLocalReaders=true)",
++        local_shards_.size(), shard_map_->ranges().size());
++    return Status::Ok();
++  }
++
+   // Gap #6.
+   auto effective = ResolveRuntimeConfig(requested, *meta_, world_size,
+                                         allowed_cpus, local_rank);
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
+index b048584..093cb98 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
+@@ -72,6 +72,7 @@ void MilvusUbRuntime::ResetLocked() {
+   meta_.reset();
+   readers_failed_ = false;
+   readers_metric_ = Metric::kL2;
++  inline_local_only_ = false;
+   recent_req_ids_ = RecentReqIdSet();
+ }
+ 
+@@ -134,6 +135,8 @@ Status MilvusUbRuntime::LoadShard(std::unique_ptr<LoadedIndex> loaded) {
+   graph_reader_.reset();
+   distance_oracle_.reset();
+   readers_failed_ = false;
++  // A new shard can change local coverage, so re-evaluate the inline choice.
++  inline_local_only_ = false;
+ 
+   return Status::Ok();
+ }
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/local_io.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/search/local_io.cpp
+index 48c64d0..29137bd 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/local_io.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/search/local_io.cpp
+@@ -2,10 +2,22 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <new>
+ 
+ namespace hnsw_urma {
+ 
++namespace {
++
++// Opaque, monotonically increasing read/write tickets. Kept out of the reader
++// objects so both stay trivially copyable/movable (Result<T> returns them by
++// value); they must be atomic because inline (preferLocalReaders) searches
++// call Submit concurrently from several delegator goroutines.
++std::atomic<ticket_t> g_local_graph_ticket{1};
++std::atomic<ticket_t> g_local_distance_ticket{1};
++
++}  // namespace
++
+ Result<LocalGraphReader> LocalGraphReader::Create(const ShardMap& shard_map,
+                                                   const UpperGraphReplica& upper,
+                                                   std::span<const LocalShard* const> shards) {
+@@ -59,7 +71,7 @@ Result<GraphTicket> LocalGraphReader::Submit(QueryKey query,
+                              neighbors.value().begin(), valid_end);
+     output->offsets.push_back(static_cast<std::uint32_t>(output->neighbors.size()));
+   }
+-  return GraphTicket{next_ticket_++, query.generation};
++  return GraphTicket{g_local_graph_ticket.fetch_add(1, std::memory_order_relaxed), query.generation};
+ }
+ 
+ Result<bool> LocalGraphReader::Poll(GraphTicket ticket) {
+@@ -158,7 +170,7 @@ Result<DistanceTicket> LocalDistanceOracle::Submit(QueryKey query,
+                   query_vector, vector.value(), metric_,
+                   implementation_);
+   }
+-  return DistanceTicket{next_ticket_++, query.generation};
++  return DistanceTicket{g_local_distance_ticket.fetch_add(1, std::memory_order_relaxed), query.generation};
+ }
+ 
+ Result<bool> LocalDistanceOracle::Poll(DistanceTicket ticket) {
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
+index 09d9189..13ab3bd 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
+@@ -1,9 +1,11 @@
+ #include "hnsw_urma/search/search.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <limits>
+ #include <new>
+ #include <optional>
+@@ -28,6 +30,55 @@ bool Better(const HeapEntry& lhs, const HeapEntry& rhs) noexcept {
+          (lhs.distance == rhs.distance && lhs.id < rhs.id);
+ }
+ 
++// Opt-in search trace, used to diff a working layout against a broken one
++// (for example 1 SN with a full seed vs 8 SNs with one shard each). The first
++// divergence between the two traces localises the bug as "wrong graph data",
++// "wrong distances" or "wrong traversal" without guessing.
++//
++//   UB_TRACE_SEARCH=1       enable (default off)
++//   UB_TRACE_SEARCH_MAX=n   number of trace lines per process (default 64)
++//   UB_TRACE_SEARCH_SKIP=n  skip the first n trace slots (default 0), so a
++//                           later query can be traced after the first ones
++//
++// Disabled runs pay one cached static bool and never call getenv again.
++bool UbTraceSearchEnabled() {
++  static const bool enabled = []() {
++    const char* raw = std::getenv("UB_TRACE_SEARCH");
++    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
++  }();
++  return enabled;
++}
++
++std::uint64_t UbTraceEnvU64(const char* name, std::uint64_t fallback) {
++  const char* raw = std::getenv(name);
++  if (raw == nullptr || raw[0] == '\0') {
++    return fallback;
++  }
++  const unsigned long long parsed = std::strtoull(raw, nullptr, 10);
++  return parsed == 0 ? fallback : static_cast<std::uint64_t>(parsed);
++}
++
++std::uint64_t UbTraceSkip() {
++  static const std::uint64_t skip = UbTraceEnvU64("UB_TRACE_SEARCH_SKIP", 0);
++  return skip;
++}
++
++std::uint64_t UbTraceLimit() {
++  static const std::uint64_t limit = UbTraceEnvU64("UB_TRACE_SEARCH_MAX", 64);
++  return limit;
++}
++
++// Returns true while this call is inside [skip, skip + limit).
++bool UbTraceTake() {
++  if (!UbTraceSearchEnabled()) {
++    return false;
++  }
++  static std::atomic<std::uint64_t> counter{0};
++  const auto index = counter.fetch_add(1, std::memory_order_relaxed);
++  const auto skip = UbTraceSkip();
++  return index >= skip && index < skip + UbTraceLimit();
++}
++
+ class ExclusiveProfileTimerState {
+  public:
+   [[nodiscard]] std::uint64_t* Enter(
+@@ -980,6 +1031,21 @@ struct HnswSearchTask::Impl {
+                         "direct graph consumer received an invalid node index");
+         }
+         ++next_node_;
++        if (UbTraceTake()) {
++          const auto& expand = search_.expansion_nodes[node_index];
++          const auto degree = neighbors.size();
++          const auto at = [&neighbors, degree](std::size_t index) {
++            return index < degree ? neighbors[index] : INVALID_NODE_ID;
++          };
++          std::fprintf(
++              stderr,
++              "[UB trace expand] slot=%u gen=%llu node=%u level=%d degree=%zu "
++              "ids=%u,%u,%u,%u\n",
++              search_.key.query_slot,
++              static_cast<unsigned long long>(search_.key.generation),
++              expand.global_id, static_cast<int>(expand.level), degree,
++              at(0), at(1), at(2), at(3));
++        }
+         search_.result.profile.edges_scanned += neighbors.size();
+         auto consumed = search_.ConsumeRouteIds(neighbors, true);
+         return consumed;
+@@ -1512,6 +1578,13 @@ struct HnswSearchTask::Impl {
+   }
+ 
+   void StartLayer0() {
++    if (UbTraceTake()) {
++      std::fprintf(stderr,
++                   "[UB trace layer0] slot=%u gen=%llu entry=%u level=%d\n",
++                   key.query_slot,
++                   static_cast<unsigned long long>(key.generation),
++                   current_id, static_cast<int>(current_level));
++    }
+     StartLayer0Timing();
+     FlushUpperLevelDropRun();
+     // Upper and layer-0 search are strictly serial. Advance the shared
+@@ -2010,6 +2083,18 @@ SearchStepResult HnswSearchTask::Step(std::chrono::steady_clock::time_point now)
+           }
+         }
+         impl_->result.profile.local_distance_count += impl_->routed_ids.size();
++        if (UbTraceTake()) {
++          const auto shown = std::min<std::size_t>(
++              impl_->commit_entries.size(), static_cast<std::size_t>(5));
++          for (std::size_t trace_index = 0; trace_index < shown;
++               ++trace_index) {
++            const auto& trace_entry = impl_->commit_entries[trace_index];
++            std::fprintf(stderr,
++                         "[UB trace commit] slot=%u id=%u dist=%.6f\n",
++                         impl_->key.query_slot, trace_entry.id,
++                         static_cast<double>(trace_entry.distance));
++          }
++        }
+         impl_->state = QueryState::kReadyLayer0Expand;
+         break;
+       }
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/transport/read_dispatcher.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/transport/read_dispatcher.cpp
+index c520a91..416e806 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/transport/read_dispatcher.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/transport/read_dispatcher.cpp
+@@ -726,63 +726,73 @@ Status TransportReadLane::Progress() {
+     // current position before advancing.
+   }
+ 
+-  post_operations_.clear();
+-  posting_slots_.clear();
+-  const auto posting_scan = backlog_size_;
+-  bool batch_key_set = false;
+-  std::uint32_t batch_peer = 0;
+-  SegmentKind batch_segment = SegmentKind::kLayer0Graph;
+-  // A bonding provider resolves list-level endpoint state from the head WR.
+-  // Rotate mismatches back through the backlog instead of mixing targets.
+-  for (std::size_t scanned = 0;
+-       scanned < posting_scan && backlog_size_ != 0 && !free_slots_.empty() &&
+-       post_operations_.size() < post_batch_;
+-       ++scanned) {
+-    auto* operation = PopBacklog();
+-    if (!batch_key_set) {
+-      batch_peer = operation->peer_rank;
+-      batch_segment = operation->remote_segment;
+-      batch_key_set = true;
+-    } else if (operation->peer_rank != batch_peer ||
+-               operation->remote_segment != batch_segment) {
+-      if (!PushBacklog(operation)) {
+-        return Status(StatusCode::kInternalError,
+-                      "READ peer grouping could not return a descriptor to backlog");
++  // Post as many batches as the lane can hold instead of one batch per
++  // Progress() call. The provider call is capped at wr_list_max (8) WRs per
++  // urma_post_jfs_wr, so a single batch per poll iteration caps a lane at 8
++  // in-flight READs while the JFS depth (1024 by default) allows far more.
++  // That ceiling is what turns per-vector READs into multi-hundred-ms
++  // submit->completion latency. Loop until the backlog drains, the free slot
++  // set empties, or the provider stops accepting WRs.
++  for (;;) {
++    post_operations_.clear();
++    posting_slots_.clear();
++    const auto posting_scan = backlog_size_;
++    bool batch_key_set = false;
++    std::uint32_t batch_peer = 0;
++    SegmentKind batch_segment = SegmentKind::kLayer0Graph;
++    // A bonding provider resolves list-level endpoint state from the head WR.
++    // Rotate mismatches back through the backlog instead of mixing targets.
++    for (std::size_t scanned = 0;
++         scanned < posting_scan && backlog_size_ != 0 && !free_slots_.empty() &&
++         post_operations_.size() < post_batch_;
++         ++scanned) {
++      auto* operation = PopBacklog();
++      if (!batch_key_set) {
++        batch_peer = operation->peer_rank;
++        batch_segment = operation->remote_segment;
++        batch_key_set = true;
++      } else if (operation->peer_rank != batch_peer ||
++                 operation->remote_segment != batch_segment) {
++        if (!PushBacklog(operation)) {
++          return Status(StatusCode::kInternalError,
++                        "READ peer grouping could not return a descriptor to backlog");
++        }
++        continue;
+       }
+-      continue;
+-    }
+-    const auto slot_index = free_slots_.back();
+-    free_slots_.pop_back();
+-    auto& slot = slots_[slot_index];
+-    ++slot.generation;
+-    if (slot.generation == 0) {
++      const auto slot_index = free_slots_.back();
++      free_slots_.pop_back();
++      auto& slot = slots_[slot_index];
+       ++slot.generation;
++      if (slot.generation == 0) {
++        ++slot.generation;
++      }
++      slot.ticket = operation->key.ticket;
++      slot.bytes = operation->bytes;
++      slot.operation = operation;
++      slot.submitted_at = std::chrono::steady_clock::now();
++      slot.state = SlotState::kPosting;
++      AsyncReadState expected = AsyncReadState::kEnqueued;
++      if (!operation->state.compare_exchange_strong(
++              expected, AsyncReadState::kPosting, std::memory_order_relaxed,
++              std::memory_order_relaxed)) {
++        return Status(StatusCode::kProtocolError,
++                      "backlogged READ descriptor changed state");
++      }
++      const auto scratch_offset = static_cast<std::size_t>(slot_index) * slot_bytes_;
++      post_operations_.push_back(
++          {OperationTicket{slot.ticket, slot_index, owner_lane_, slot.generation},
++           operation->peer_rank, operation->remote_segment,
++           std::span<std::byte>(scratch_).subspan(scratch_offset, slot.bytes),
++           operation->remote_offset});
++      posting_slots_.push_back(slot_index);
+     }
+-    slot.ticket = operation->key.ticket;
+-    slot.bytes = operation->bytes;
+-    slot.operation = operation;
+-    slot.submitted_at = std::chrono::steady_clock::now();
+-    slot.state = SlotState::kPosting;
+-    AsyncReadState expected = AsyncReadState::kEnqueued;
+-    if (!operation->state.compare_exchange_strong(
+-            expected, AsyncReadState::kPosting, std::memory_order_relaxed,
+-            std::memory_order_relaxed)) {
+-      return Status(StatusCode::kProtocolError,
+-                    "backlogged READ descriptor changed state");
++    if (backlog_size_ != 0 && free_slots_.empty()) {
++      ++profile_.slot_full_count;
++    }
++    if (post_operations_.empty()) {
++      break;
+     }
+-    const auto scratch_offset = static_cast<std::size_t>(slot_index) * slot_bytes_;
+-    post_operations_.push_back(
+-        {OperationTicket{slot.ticket, slot_index, owner_lane_, slot.generation},
+-         operation->peer_rank, operation->remote_segment,
+-         std::span<std::byte>(scratch_).subspan(scratch_offset, slot.bytes),
+-         operation->remote_offset});
+-    posting_slots_.push_back(slot_index);
+-  }
+-  if (backlog_size_ != 0 && free_slots_.empty()) {
+-    ++profile_.slot_full_count;
+-  }
+ 
+-  if (!post_operations_.empty()) {
+     const auto posted = engine_->PostReads(post_operations_);
+     const auto posted_at = std::chrono::steady_clock::now();
+     if (posted.posted > posting_slots_.size()) {
+@@ -825,6 +835,15 @@ Status TransportReadLane::Progress() {
+         }
+       }
+     }
++    // The lane hit the provider outstanding limit (or a partial post):
++    // leave the remaining backlog for the next Progress() call. The next
++    // poll drains completions and frees slots again.
++    if (posted.posted < posting_slots_.size()) {
++      break;
++    }
++    if (backlog_size_ == 0 || free_slots_.empty()) {
++      break;
++    }
+   }
+   profile_.high_watermark =
+       std::max<std::uint64_t>(profile_.high_watermark,
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
+index 99f5134..d217a39 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
+@@ -58,6 +58,18 @@ void UbSetUrmaDevice(const char* device_name) {
+   hnsw_urma::MilvusUbRuntime::Instance().SetKnobs(knobs);
+ }
+ 
++void UbSetMaxActiveQueries(uint32_t max_active_queries) {
++  auto knobs = hnsw_urma::MilvusUbRuntime::Instance().GetKnobs();
++  knobs.max_active_queries = max_active_queries;
++  hnsw_urma::MilvusUbRuntime::Instance().SetKnobs(knobs);
++}
++
++void UbSetPreferLocalReaders(int enable) {
++  auto knobs = hnsw_urma::MilvusUbRuntime::Instance().GetKnobs();
++  knobs.prefer_local_readers = enable != 0;
++  hnsw_urma::MilvusUbRuntime::Instance().SetKnobs(knobs);
++}
++
+ void UbSetConfig(uint32_t search_workers,
+                  uint32_t distance_workers,
+                  uint32_t read_progress_workers,
+@@ -101,6 +113,12 @@ void UbSetConfig(uint32_t search_workers,
+     if (!cur.urma_device.empty() && knobs.urma_device.empty()) {
+       knobs.urma_device = cur.urma_device;
+     }
++    // Same reasoning for knobs staged by their own setters: a UbSetConfig call
++    // must not reset them to their defaults.
++    knobs.max_active_queries = cur.max_active_queries;
++    if (!cur.prefer_local_readers) {
++      knobs.prefer_local_readers = false;
++    }
+   }
+   hnsw_urma::MilvusUbRuntime::Instance().SetKnobs(knobs);
+ }
+diff --git a/internal/querynodev2/server.go b/internal/querynodev2/server.go
+index 3363db5..6874f0f 100644
+--- a/internal/querynodev2/server.go
++++ b/internal/querynodev2/server.go
+@@ -147,6 +147,9 @@ type QueryNode struct {
+ 	urmaDiscovery      *urma.EndpointDiscovery
+ 	urmaResources      urma.ResourceDirectory
+ 	urmaLinkCache      *urma.LinkCache
++	// urmaResourceCache serves the UB search fast path a cached directory
++	// snapshot instead of one etcd round trip per record per search.
++	urmaResourceCache  *ubResourceCache
+ 	urmaOperations     *urma.OperationGate
+ 	urmaLocalMu        sync.Mutex
+ 	urmaLocalMemory    map[string]urmaLocalMemory
+@@ -906,6 +909,11 @@ func (node *QueryNode) startUrmaDiscovery() error {
+ 	} else {
+ 		node.urmaResources = resourceDirectory
+ 	}
++	// Cache the directory snapshot for the search fast path: the raw
++	// Snapshot does one prefix Get plus one TimeToLive per record, which used
++	// to run on every search. 0 disables the cache.
++	snapshotTTL := time.Duration(params.QueryNodeCfg.UbResourceSnapshotTTLSeconds.GetAsInt64()) * time.Second
++	node.urmaResourceCache = newUbResourceCache(node.ctx, node.urmaResources, snapshotTTL)
+ 	discovery := urma.NewEndpointDiscovery(node.urmaConnections, directory, time.Second)
+ 	publication := urma.LocalPublication{
+ 		Endpoint: local.Endpoint,
+@@ -1127,17 +1135,44 @@ func (node *QueryNode) prepareUbSearch(ctx context.Context) error {
+ 	if node.urmaResources == nil || node.urmaLinkCache == nil {
+ 		return errors.New("UB prepare: URMA resource directory or link cache is unavailable")
+ 	}
+-	records, _, err := node.urmaResources.Snapshot(ctx)
++	var (
++		records []urma.ResourceRecord
++		err     error
++	)
++	ownNodeID := strconv.FormatInt(node.GetNodeID(), 10)
++	activate := func(records []urma.ResourceRecord) error {
++		return ub.ActivatePublishedShards(ctx, records, ownNodeID, node.urmaLinkCache,
++			func(record urma.ResourceRecord) error {
++				return initcore.UbValidateShardLayout(record.ShardID, record.ShardCount,
++					record.EntryShardID, record.EntryVertexID)
++			})
++	}
++	if node.urmaResourceCache != nil {
++		// Cached snapshot: the directory only changes on load/unload, and a
++		// stale record still has to pass link activation below.
++		records, _, err = node.urmaResourceCache.Snapshot(ctx)
++	} else {
++		records, _, err = node.urmaResources.Snapshot(ctx)
++	}
+ 	if err != nil {
+ 		return err
+ 	}
+-	ownNodeID := strconv.FormatInt(node.GetNodeID(), 10)
+-	if err := ub.ActivatePublishedShards(ctx, records, ownNodeID, node.urmaLinkCache,
+-		func(record urma.ResourceRecord) error {
+-			return initcore.UbValidateShardLayout(record.ShardID, record.ShardCount,
+-				record.EntryShardID, record.EntryVertexID)
+-		}); err != nil {
+-		return err
++	if err := activate(records); err != nil {
++		// A cached snapshot may predate a shard's publication (load/unload
++		// race). Refetch once before failing the search: the error path costs
++		// at most one extra directory read, and a successful retry keeps the
++		// first search after a load from failing on a stale cache.
++		if node.urmaResourceCache == nil {
++			return err
++		}
++		node.urmaResourceCache.Invalidate()
++		fresh, _, fetchErr := node.urmaResourceCache.Snapshot(ctx)
++		if fetchErr != nil {
++			return err
++		}
++		if retryErr := activate(fresh); retryErr != nil {
++			return retryErr
++		}
+ 	}
+ 	// True distributed search (T5): after the peer links are activated and
+ 	// their handles imported into the UB runtime, build/start the
+diff --git a/internal/querynodev2/ub/ub_search.go b/internal/querynodev2/ub/ub_search.go
+index ef529f2..b76587b 100644
+--- a/internal/querynodev2/ub/ub_search.go
++++ b/internal/querynodev2/ub/ub_search.go
+@@ -28,6 +28,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"math"
++	"sync"
+ 	"sync/atomic"
+ 
+ 	"google.golang.org/protobuf/proto"
+@@ -145,8 +146,6 @@ func parseQueries(req *internalpb.SearchRequest) ([][]float32, error) {
+ 	return vectors, nil
+ }
+ 
+-var inf = float32(math.Inf(1))
+-
+ // reqCounter distinguishes repeated searches that carry the same proxy
+ // reqID (the C++ side dedupes by req_id alone).
+ var reqCounter uint64
+@@ -200,38 +199,79 @@ func RunSearch(ctx context.Context, collectionID int64, req SearchRequestMinimal
+ 	// Per-query results. A query is served by this QN only when it is the
+ 	// main rank (owner of the target shard); otherwise the entry is left
+ 	// empty and another QN fills it.
+-	allIds := make([]int64, 0, len(queries)*int(topk))
+-	allDists := make([]float32, 0, len(queries)*int(topk))
+-	topks := make([]int64, 0, len(queries))
++	//
++	// The nq queries are submitted concurrently: the C++ runtime admits up to
++	// queryNode.ub.maxActiveQueries searches in parallel (one control thread
++	// plus cfg->search_workers), so a sequential loop turned an nq=100 request
++	// into 100 serialized global searches. Each query keeps its own dedupe key,
++	// so the main-rank rotation across QNs is unchanged.
++	type queryOutcome struct {
++		ids   []int64
++		dists []float32
++		rows  int64
++		err   error
++	}
++	outcomes := make([]queryOutcome, len(queries))
++	concurrency := paramtable.Get().QueryNodeCfg.UbMaxActiveQueries.GetAsInt()
++	if concurrency <= 0 {
++		concurrency = 16
++	}
++	if concurrency > len(queries) {
++		concurrency = len(queries)
++	}
+ 	dedupeSeq := uint64(atomic.AddUint64(&reqCounter, 1))
++	dedupeKey := dedupeSeq<<32 | uint64(uint32(reqID))
+ 
++	sem := make(chan struct{}, concurrency)
++	var wg sync.WaitGroup
+ 	for i, q := range queries {
+-		var out ubcgo.UbSearchEntryResult
+-		// Offset by query index so a batch of queries spreads across QNs.
+-		// The C++ side dedupes by req_id to keep one result per request
+-		// when several vchannel delegators receive it. reqID is only
+-		// unique per proxy attempt, so mix in a per-process counter to
+-		// keep retries/second searches of the same request distinct.
+-		dedupeKey := dedupeSeq<<32 | uint64(uint32(reqID))
+-		err := ubcgo.UbSearchEntry(dedupeKey+uint64(i), q, 1, dim,
+-			int(topk), int(ef), metricType, &out)
+-		if err != nil {
+-			return nil, err
+-		}
+-		if !out.IsMain {
+-			// Another QN is main for this query; contribute nothing.
+-			// Pad with the -1/+inf sentinel (never a valid row) and
+-			// report zero rows so downstream reducers skip them.
+-			for j := int64(0); j < topk; j++ {
+-				allIds = append(allIds, -1)
+-				allDists = append(allDists, inf)
++		wg.Add(1)
++		sem <- struct{}{}
++		go func(index int, query []float32) {
++			defer wg.Done()
++			defer func() { <-sem }()
++			var out ubcgo.UbSearchEntryResult
++			// Offset by query index so a batch of queries spreads across QNs.
++			// The C++ side dedupes by req_id to keep one result per request
++			// when several vchannel delegators receive it. reqID is only
++			// unique per proxy attempt, so mix in a per-process counter to
++			// keep retries/second searches of the same request distinct.
++			err := ubcgo.UbSearchEntry(dedupeKey+uint64(index), query, 1, dim,
++				int(topk), int(ef), metricType, &out)
++			if err != nil {
++				outcomes[index].err = err
++				return
++			}
++			if !out.IsMain {
++				// Another QN owns this query: contribute NO rows at all.
++				//
++				// Milvus locates a query's rows by the cumulative sum of
++				// ResultData.Topks (see internal/proxy/search_agg/computer.go
++				// and every other blob consumer), i.e. the arrays are
++				// COMPACTED: len(Ids) == len(Scores) == sum(Topks). Padding a
++				// non-main query with topk sentinel rows keeps a fixed stride
++				// and shifts every later query's rows, which is exactly how a
++				// correct global topk turns into -1 rows after the merge.
++				outcomes[index].rows = 0
++				return
+ 			}
+-			topks = append(topks, 0)
+-			continue
++			outcomes[index].ids = out.Ids
++			outcomes[index].dists = out.Dists
++			outcomes[index].rows = int64(len(out.Ids))
++		}(i, q)
++	}
++	wg.Wait()
++
++	allIds := make([]int64, 0, len(queries)*int(topk))
++	allDists := make([]float32, 0, len(queries)*int(topk))
++	topks := make([]int64, 0, len(queries))
++	for i := range outcomes {
++		if outcomes[i].err != nil {
++			return nil, outcomes[i].err
+ 		}
+-		allIds = append(allIds, out.Ids...)
+-		allDists = append(allDists, out.Dists...)
+-		topks = append(topks, int64(len(out.Ids)))
++		allIds = append(allIds, outcomes[i].ids...)
++		allDists = append(allDists, outcomes[i].dists...)
++		topks = append(topks, outcomes[i].rows)
+ 	}
+ 
+ 	mlog.Info(ctx, "UB fast path search done",
+diff --git a/internal/querynodev2/ub_resource_cache.go b/internal/querynodev2/ub_resource_cache.go
+new file mode 100644
+index 0000000..a6c968d
+--- /dev/null
++++ b/internal/querynodev2/ub_resource_cache.go
+@@ -0,0 +1,164 @@
++// Licensed to the LF AI & Data foundation under one
++// or more contributor license agreements. See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership. The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License. You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package querynodev2
++
++import (
++	"context"
++	"sync"
++	"time"
++
++	"github.com/milvus-io/milvus/internal/util/urma"
++	"github.com/milvus-io/milvus/pkg/v3/mlog"
++)
++
++// ubResourceCache keeps the last consistent URMA resource-directory snapshot
++// so the UB search fast path does not pay for it on every request.
++//
++// ResourceDirectory.Snapshot issues one etcd prefix Get plus one TimeToLive
++// call per published record. With 8 shards x 2 roles that is 17 etcd round
++// trips per search, all on the critical path before the UB runtime is even
++// entered. The directory is lease-bound and changes only on load/unload, so a
++// short-lived cache with stale-while-revalidate semantics is safe: a record
++// that disappears is still validated by the link cache and by the READ itself,
++// and a stale entry can only cost one failed activation attempt.
++//
++// Reads never block on the refresh except for the very first snapshot: a stale
++// snapshot is served immediately while a background goroutine refreshes it.
++type ubResourceCache struct {
++	directory urma.ResourceDirectory
++	ttl       time.Duration
++	// baseCtx outlives individual searches so a background refresh started by
++	// one request is not cancelled when that request returns.
++	baseCtx context.Context
++
++	mu         sync.Mutex
++	records    []urma.ResourceRecord
++	revision   int64
++	fetchedAt  time.Time
++	refreshing bool
++	refreshCh  chan struct{}
++}
++
++// newUbResourceCache returns nil when caching is disabled (ttl <= 0) so the
++// caller can fall back to a direct Snapshot on every search.
++func newUbResourceCache(ctx context.Context, directory urma.ResourceDirectory, ttl time.Duration) *ubResourceCache {
++	if directory == nil || ttl <= 0 {
++		return nil
++	}
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	return &ubResourceCache{directory: directory, ttl: ttl, baseCtx: ctx}
++}
++
++// Snapshot returns the cached records when they are still fresh, a stale copy
++// while a background refresh runs, and otherwise blocks for one fetch. The
++// returned slice is shared and must be treated as read-only.
++func (c *ubResourceCache) Snapshot(ctx context.Context) ([]urma.ResourceRecord, int64, error) {
++	if c == nil {
++		return nil, 0, nil
++	}
++	for {
++		c.mu.Lock()
++		hasData := c.records != nil
++		fresh := hasData && time.Since(c.fetchedAt) < c.ttl
++		if fresh {
++			records, revision := c.records, c.revision
++			c.mu.Unlock()
++			return records, revision, nil
++		}
++		if hasData {
++			// Stale but usable: serve it now and let a background refresh
++			// replace the contents. This keeps search off the etcd path.
++			if !c.refreshing {
++				c.startRefreshLocked()
++			}
++			records, revision := c.records, c.revision
++			c.mu.Unlock()
++			return records, revision, nil
++		}
++		if c.refreshing {
++			// First snapshot in flight: wait for it instead of issuing a
++			// duplicate prefix Get.
++			wait := c.refreshCh
++			c.mu.Unlock()
++			select {
++			case <-wait:
++				continue
++			case <-ctx.Done():
++				return nil, 0, ctx.Err()
++			}
++		}
++		c.refreshing = true
++		c.refreshCh = make(chan struct{})
++		wait := c.refreshCh
++		c.mu.Unlock()
++
++		records, revision, err := c.directory.Snapshot(ctx)
++
++		c.mu.Lock()
++		c.refreshing = false
++		c.refreshCh = nil
++		if err == nil {
++			c.records = records
++			c.revision = revision
++			c.fetchedAt = time.Now()
++		}
++		c.mu.Unlock()
++		close(wait)
++		if err != nil {
++			return nil, 0, err
++		}
++		return records, revision, nil
++	}
++}
++
++// startRefreshLocked kicks a background refresh. The caller must hold c.mu.
++func (c *ubResourceCache) startRefreshLocked() {
++	c.refreshing = true
++	c.refreshCh = make(chan struct{})
++	done := c.refreshCh
++	go func() {
++		records, revision, err := c.directory.Snapshot(c.baseCtx)
++		c.mu.Lock()
++		c.refreshing = false
++		c.refreshCh = nil
++		if err == nil {
++			c.records = records
++			c.revision = revision
++			c.fetchedAt = time.Now()
++		}
++		c.mu.Unlock()
++		close(done)
++		if err != nil {
++			// Keep the previous snapshot: a transient etcd error must not take
++			// the search path down, and the next request will retry.
++			mlog.Warn(c.baseCtx, "URMA resource snapshot refresh failed; keeping the previous snapshot",
++				mlog.Err(err))
++		}
++	}()
++}
++
++// Invalidate forces the next Snapshot call to refetch synchronously.
++func (c *ubResourceCache) Invalidate() {
++	if c == nil {
++		return
++	}
++	c.mu.Lock()
++	c.fetchedAt = time.Time{}
++	c.mu.Unlock()
++}
+diff --git a/internal/querynodev2/ub_resource_cache_test.go b/internal/querynodev2/ub_resource_cache_test.go
+new file mode 100644
+index 0000000..53f3e4f
+--- /dev/null
++++ b/internal/querynodev2/ub_resource_cache_test.go
+@@ -0,0 +1,129 @@
++// Licensed to the LF AI & Data foundation under one
++// or more contributor license agreements. See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership. The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License. You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package querynodev2
++
++import (
++	"context"
++	"errors"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/milvus-io/milvus/internal/util/urma"
++)
++
++// fakeResourceDirectory implements only Snapshot; the cache never calls the
++// other directory methods. The embedded interface keeps that explicit.
++type fakeResourceDirectory struct {
++	urma.ResourceDirectory
++	calls   atomic.Int32
++	records []urma.ResourceRecord
++	err     error
++	delay   time.Duration
++}
++
++func (f *fakeResourceDirectory) Snapshot(ctx context.Context) ([]urma.ResourceRecord, int64, error) {
++	f.calls.Add(1)
++	if f.delay > 0 {
++		select {
++		case <-time.After(f.delay):
++		case <-ctx.Done():
++			return nil, 0, ctx.Err()
++		}
++	}
++	if f.err != nil {
++		return nil, 0, f.err
++	}
++	return f.records, int64(f.calls.Load()), nil
++}
++
++func TestUbResourceCacheDisabledWhenTTLZero(t *testing.T) {
++	dir := &fakeResourceDirectory{records: []urma.ResourceRecord{{SegmentID: "a"}}}
++	assert.Nil(t, newUbResourceCache(context.Background(), dir, 0))
++	assert.Nil(t, newUbResourceCache(context.Background(), nil, time.Second))
++
++	var nilCache *ubResourceCache
++	records, revision, err := nilCache.Snapshot(context.Background())
++	require.NoError(t, err)
++	assert.Nil(t, records)
++	assert.Zero(t, revision)
++}
++
++func TestUbResourceCacheReusesFreshSnapshot(t *testing.T) {
++	dir := &fakeResourceDirectory{
++		records: []urma.ResourceRecord{{SegmentID: "shard-0"}, {SegmentID: "shard-1"}},
++	}
++	cache := newUbResourceCache(context.Background(), dir, time.Hour)
++	require.NotNil(t, cache)
++
++	first, revision, err := cache.Snapshot(context.Background())
++	require.NoError(t, err)
++	assert.Len(t, first, 2)
++	assert.Equal(t, int64(1), revision)
++
++	second, _, err := cache.Snapshot(context.Background())
++	require.NoError(t, err)
++	assert.Equal(t, first, second)
++	// A fresh snapshot must not reach etcd again.
++	assert.Equal(t, int32(1), dir.calls.Load())
++}
++
++func TestUbResourceCacheServesStaleWhileRefreshing(t *testing.T) {
++	dir := &fakeResourceDirectory{
++		records: []urma.ResourceRecord{{SegmentID: "shard-0"}},
++		delay:   50 * time.Millisecond,
++	}
++	cache := newUbResourceCache(context.Background(), dir, time.Millisecond)
++
++	records, _, err := cache.Snapshot(context.Background())
++	require.NoError(t, err)
++	require.Len(t, records, 1)
++
++	time.Sleep(5 * time.Millisecond)
++
++	// Stale: the cached copy is returned immediately and a refresh starts in
++	// the background, so the search never blocks on etcd here.
++	started := time.Now()
++	stale, _, err := cache.Snapshot(context.Background())
++	require.NoError(t, err)
++	assert.Len(t, stale, 1)
++	assert.Less(t, time.Since(started), dir.delay)
++
++	// The background refresh must reach the directory exactly once more.
++	require.Eventually(t, func() bool { return dir.calls.Load() == 2 }, 2*time.Second, 5*time.Millisecond)
++}
++
++func TestUbResourceCacheRetriesAfterFirstFetchError(t *testing.T) {
++	dir := &fakeResourceDirectory{err: errors.New("etcd unavailable")}
++	cache := newUbResourceCache(context.Background(), dir, time.Hour)
++
++	_, _, err := cache.Snapshot(context.Background())
++	require.Error(t, err)
++	assert.Equal(t, int32(1), dir.calls.Load())
++
++	// No snapshot was cached, so the next call must try again instead of
++	// serving an empty directory.
++	dir.err = nil
++	dir.records = []urma.ResourceRecord{{SegmentID: "shard-0"}}
++	records, _, err := cache.Snapshot(context.Background())
++	require.NoError(t, err)
++	assert.Len(t, records, 1)
++	assert.Equal(t, int32(2), dir.calls.Load())
++}
+diff --git a/internal/util/initcore/ub_config.go b/internal/util/initcore/ub_config.go
+index 33b1ed3..3bd4536 100644
+--- a/internal/util/initcore/ub_config.go
++++ b/internal/util/initcore/ub_config.go
+@@ -78,6 +78,15 @@ func InitUbRuntime(ctx context.Context) {
+ 		cBindMode, cLayout, cProgressMode,
+ 		cCpus, C.uint32_t(len(cpus)))
+ 
++	// Runtime bounds, staged before the first search so the C++ side sizes its
++	// query slot pool and per-slot scratch accordingly.
++	C.UbSetMaxActiveQueries(C.uint32_t(cfg.UbMaxActiveQueries.GetAsUint32()))
++	if cfg.UbPreferLocalReaders.GetAsBool() {
++		C.UbSetPreferLocalReaders(1)
++	} else {
++		C.UbSetPreferLocalReaders(0)
++	}
++
+ 	mlog.Info(ctx, "UB config staged",
+ 		mlog.Uint32("search", search),
+ 		mlog.Uint32("distance", distance),
+@@ -86,7 +95,9 @@ func InitUbRuntime(ctx context.Context) {
+ 		mlog.String("cpuBindMode", bindMode),
+ 		mlog.String("cpuLayout", layout),
+ 		mlog.String("progressMode", progressMode),
+-		mlog.Int("allowedCpus", len(cpus)))
++		mlog.Int("allowedCpus", len(cpus)),
++		mlog.Uint32("maxActiveQueries", cfg.UbMaxActiveQueries.GetAsUint32()),
++		mlog.Bool("preferLocalReaders", cfg.UbPreferLocalReaders.GetAsBool()))
+ 
+ 	// Stage 5: optionally seed the UB runtime singleton directly from a
+ 	// local triple dir. This lets the delegator QN (e.g. the embedded QN
+diff --git a/pkg/util/paramtable/component_param.go b/pkg/util/paramtable/component_param.go
+index 82a7688..71c78ba 100644
+--- a/pkg/util/paramtable/component_param.go
++++ b/pkg/util/paramtable/component_param.go
+@@ -3772,6 +3772,16 @@ type queryNodeConfig struct {
+ 	UbNumaNode         ParamItem `refreshable:"false"`
+ 	UbSeedDir          ParamItem `refreshable:"false"`
+ 	UbShardIds         ParamItem `refreshable:"false"`
++	// UbMaxActiveQueries bounds concurrent in-flight queries per UB runtime
++	// (sizes the C++ slot pool and the Go-side fan-out of one nq>1 request).
++	UbMaxActiveQueries ParamItem `refreshable:"false"`
++	// UbResourceSnapshotTTLSeconds caches the URMA resource directory snapshot
++	// so the search fast path does not issue one etcd Get plus one TimeToLive
++	// per record per request.
++	UbResourceSnapshotTTLSeconds ParamItem `refreshable:"false"`
++	// UbPreferLocalReaders makes a QN that holds every shard serve search from
++	// its local readers instead of reading its own shards back over URMA.
++	UbPreferLocalReaders ParamItem `refreshable:"false"`
+ }
+ 
+ func formatDurationWithMillisecondFallback(v string) string {
+@@ -5405,6 +5415,33 @@ user-task-polling:
+ 	}
+ 	p.UbProgressMode.Init(base.mgr)
+ 
++	p.UbMaxActiveQueries = ParamItem{
++		Key:          "queryNode.ub.maxActiveQueries",
++		Version:      "3.0.0",
++		DefaultValue: "16",
++		Doc:          "maximum concurrent in-flight UB queries per QueryNode; also bounds the fan-out of one multi-query request",
++		Export:       false,
++	}
++	p.UbMaxActiveQueries.Init(base.mgr)
++
++	p.UbResourceSnapshotTTLSeconds = ParamItem{
++		Key:          "queryNode.ub.resourceSnapshotTtlSeconds",
++		Version:      "3.0.0",
++		DefaultValue: "5",
++		Doc:          "how long the URMA resource directory snapshot is reused before a background refresh; 0 disables caching",
++		Export:       false,
++	}
++	p.UbResourceSnapshotTTLSeconds.Init(base.mgr)
++
++	p.UbPreferLocalReaders = ParamItem{
++		Key:          "queryNode.ub.preferLocalReaders",
++		Version:      "3.0.0",
++		DefaultValue: "true",
++		Doc:          "when this QueryNode holds every UB shard locally, serve search from local readers instead of reading own shards over URMA",
++		Export:       false,
++	}
++	p.UbPreferLocalReaders.Init(base.mgr)
++
+ 	p.UbAllowedCpusSource = ParamItem{
+ 		Key:          "queryNode.ub.allowedCpusSource",
+ 		Version:      "3.0.0",
