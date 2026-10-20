@@ -1,0 +1,57 @@
+这份诊断有一个关键误报：你的 etcd 前缀少了 /meta，所以"0 条"是假象，而且 peer_handles=14 / ready=true 本身就证明目录里有记录（否则激活不可能成功、句柄不会出现）。
+
+1. 先纠正 etcd 检查
+代码里前缀是 path.Join(metaRoot, "urma/resources")（resource_directory.go:383），而 metaRoot = EtcdCfg.MetaRootPath = by-dev/meta。所以真实 key 是：
+
+代码块
+
+
+by-dev/meta/urma/resources/<ownerNodeID>/<segmentID>
+by-dev/meta/urma/endpoints/<nodeID>
+正确的查法（注意：你 milvus.yaml 里 etcd.auth.enabled: false，不要带 --user，否则 etcd 会返回 authentication is not enabled，管道计数同样是 0，又变成假象）：
+
+bash
+
+
+E="docker exec milvus2-etcd-1 /usr/local/bin/etcdctl --endpoints http://127.0.0.1:2379"
+$E get --prefix --keys-only by-dev/meta/urma/resources | sed 's#.*/resources/##' | cut -d/ -f1 | sort -n | uniq -c
+$E get --prefix --keys-only by-dev/meta/urma/endpoints | sed 's#.*/endpoints/##' | sort -n
+预期：8 个 owner 各 2 条（topology+vectors）、8 个 endpoint。这应该和你 peer_handles=14 一致——如果不一致，那才需要再查。
+
+2. 真正的问题在"读回来的内容"，不在目录
+既然 missing=0 / ready=true 且 falling back to native=0，说明：UB 路径在用 URMA 跑、没报错、但结果是错的。这和我之前押的 S2 吻合：远端 READ 拿到的是零/错数据，距离全乱 → recall 0.0010。
+
+代码里正好留了一个探针，每个进程只打前 16 条 READ 的目标缓冲区前 16 字节：
+
+bash
+
+
+grep -h 'UB PollRead' /tmp/inst2-sn_0.log | head -16
+grep -h 'UB PollRead' /tmp/inst2-sn_0.log | grep -c 'first16=00000000 00000000 00000000 00000000'
+判读：
+
+结果	含义
+first16 全 0、cr_status=0	READ "成功"但没搬到数据 → 目标段/句柄无效 → 数据面 bug（下一条）
+first16 非 0	数据是对的 → 问题在 entry point/分派/oracle 选路，另查
+3. 为什么 8-SN 会坏、而 1SN+8QN 好（我的解释）
+唯一的结构性差别：发布者变成了搜索者本身。
+
+1SN+8QN：数据由普通 worker QN 发布，它只做被读方，只注册一次（UrmaManager）→ 远端 READ 正常（你测过 recall 0.9360）。
+8-SN：每个 SN 的内嵌 QN 先由 UrmaManager 注册并发布 graph/vector 内存，随后 EnableDistributedSearchLocked 又用 UrmaResourceBundle::CreateLocal 对同一块地址注册一次（milvus_distributed_runtime.cpp:392-427）。peer 拿到的是第一次注册的 target_segment；如果驱动在二次注册后让旧句柄/UBVA 失效或换 token，远端 READ 就会"完成但没有数据"——这正是你们代码注释里记过的 all-zero READ 那一类。
+这也解释了为什么 preferLocal=true（全本地、无人远端读自己）一切正常。
+
+4. 10 分钟分叉实验：2 个 SN（4+4）
+bash
+
+
+# SN#0: shardIds=0,1,2,3   SN#1: shardIds=4,5,6,7   （另外 6 个 SN 不起）
+2-SN 也 recall≈0 → 与 8 路无关，就是"发布者=搜索者"的重复注册/句柄问题 → 我改 C++（见下）。
+2-SN recall≈0.9 → 问题在 8 路的资源量（8×context/jetty/memory），那是另一类修法。
+5. 如果是前者，我的修法方向（先说明，等你确认再动手）
+EnableDistributedSearchLocked 现在把 6 段内存一起注册：local_graph, local_vectors, rpc_requests, rpc_responses, notify, scratch（milvus_distributed_runtime.cpp:392-415）。而 pull 模式下，本地 graph/vector 根本不需要注册——搜索进程对本地分片是直接内存访问（LocalShard），远端读也只读 peer 的段；这两段注册纯属给将来的 distance 服务预留。所以最小修法是：
+
+本地 graph/vector 不再进 bundle 注册（或只在启用 distance 服务时注册）；
+保留 UrmaManager 那一次注册作为 peer 可见的唯一句柄。
+这样既不重复注册，也不改 Go 侧发布逻辑。改完用 2-SN 先验，再上 8-SN。
+
+请把 UB PollRead 的前几行（和 first16 全零的条数）贴出来——这一条能直接判定是数据面还是选路，也决定我要不要动 CreateLocal 那段。
