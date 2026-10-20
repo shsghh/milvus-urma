@@ -377,7 +377,7 @@ index 32640c3..6c143fe 100644
    CpuBindMode bind_mode = CpuBindMode::kAuto;
    if (knobs_.cpu_bind_mode == "none") {
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
-index 093cb98..d58204b 100644
+index 093cb98..69e7c13 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
 @@ -440,9 +440,12 @@ Status MilvusUbRuntime::ImportPeerHandles(shard_id_t shard_id, std::uint32_t rol
@@ -404,7 +404,7 @@ index 093cb98..d58204b 100644
 +  if (!distributed_runtime_ || !distributed_runtime_->rpc_memory) {
 +    return false;
 +  }
-+  const auto& memory = *distributed_runtime_->rpc_memory;
++  auto& memory = *distributed_runtime_->rpc_memory;
 +  const std::array<std::span<std::byte>, 3> regions{
 +      memory.request_registration(), memory.response_registration(),
 +      memory.notify_registration()};
