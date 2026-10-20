@@ -1,0 +1,127 @@
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
+index 09d9189..13ab3bd 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
+@@ -1,9 +1,11 @@
+ #include "hnsw_urma/search/search.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <limits>
+ #include <new>
+ #include <optional>
+@@ -28,6 +30,55 @@ bool Better(const HeapEntry& lhs, const HeapEntry& rhs) noexcept {
+          (lhs.distance == rhs.distance && lhs.id < rhs.id);
+ }
+ 
++// Opt-in search trace, used to diff a working layout against a broken one
++// (for example 1 SN with a full seed vs 8 SNs with one shard each). The first
++// divergence between the two traces localises the bug as "wrong graph data",
++// "wrong distances" or "wrong traversal" without guessing.
++//
++//   UB_TRACE_SEARCH=1       enable (default off)
++//   UB_TRACE_SEARCH_MAX=n   number of trace lines per process (default 64)
++//   UB_TRACE_SEARCH_SKIP=n  skip the first n trace slots (default 0), so a
++//                           later query can be traced after the first ones
++//
++// Disabled runs pay one cached static bool and never call getenv again.
++bool UbTraceSearchEnabled() {
++  static const bool enabled = []() {
++    const char* raw = std::getenv("UB_TRACE_SEARCH");
++    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
++  }();
++  return enabled;
++}
++
++std::uint64_t UbTraceEnvU64(const char* name, std::uint64_t fallback) {
++  const char* raw = std::getenv(name);
++  if (raw == nullptr || raw[0] == '\0') {
++    return fallback;
++  }
++  const unsigned long long parsed = std::strtoull(raw, nullptr, 10);
++  return parsed == 0 ? fallback : static_cast<std::uint64_t>(parsed);
++}
++
++std::uint64_t UbTraceSkip() {
++  static const std::uint64_t skip = UbTraceEnvU64("UB_TRACE_SEARCH_SKIP", 0);
++  return skip;
++}
++
++std::uint64_t UbTraceLimit() {
++  static const std::uint64_t limit = UbTraceEnvU64("UB_TRACE_SEARCH_MAX", 64);
++  return limit;
++}
++
++// Returns true while this call is inside [skip, skip + limit).
++bool UbTraceTake() {
++  if (!UbTraceSearchEnabled()) {
++    return false;
++  }
++  static std::atomic<std::uint64_t> counter{0};
++  const auto index = counter.fetch_add(1, std::memory_order_relaxed);
++  const auto skip = UbTraceSkip();
++  return index >= skip && index < skip + UbTraceLimit();
++}
++
+ class ExclusiveProfileTimerState {
+  public:
+   [[nodiscard]] std::uint64_t* Enter(
+@@ -980,6 +1031,21 @@ struct HnswSearchTask::Impl {
+                         "direct graph consumer received an invalid node index");
+         }
+         ++next_node_;
++        if (UbTraceTake()) {
++          const auto& expand = search_.expansion_nodes[node_index];
++          const auto degree = neighbors.size();
++          const auto at = [&neighbors, degree](std::size_t index) {
++            return index < degree ? neighbors[index] : INVALID_NODE_ID;
++          };
++          std::fprintf(
++              stderr,
++              "[UB trace expand] slot=%u gen=%llu node=%u level=%d degree=%zu "
++              "ids=%u,%u,%u,%u\n",
++              search_.key.query_slot,
++              static_cast<unsigned long long>(search_.key.generation),
++              expand.global_id, static_cast<int>(expand.level), degree,
++              at(0), at(1), at(2), at(3));
++        }
+         search_.result.profile.edges_scanned += neighbors.size();
+         auto consumed = search_.ConsumeRouteIds(neighbors, true);
+         return consumed;
+@@ -1512,6 +1578,13 @@ struct HnswSearchTask::Impl {
+   }
+ 
+   void StartLayer0() {
++    if (UbTraceTake()) {
++      std::fprintf(stderr,
++                   "[UB trace layer0] slot=%u gen=%llu entry=%u level=%d\n",
++                   key.query_slot,
++                   static_cast<unsigned long long>(key.generation),
++                   current_id, static_cast<int>(current_level));
++    }
+     StartLayer0Timing();
+     FlushUpperLevelDropRun();
+     // Upper and layer-0 search are strictly serial. Advance the shared
+@@ -2010,6 +2083,18 @@ SearchStepResult HnswSearchTask::Step(std::chrono::steady_clock::time_point now)
+           }
+         }
+         impl_->result.profile.local_distance_count += impl_->routed_ids.size();
++        if (UbTraceTake()) {
++          const auto shown = std::min<std::size_t>(
++              impl_->commit_entries.size(), static_cast<std::size_t>(5));
++          for (std::size_t trace_index = 0; trace_index < shown;
++               ++trace_index) {
++            const auto& trace_entry = impl_->commit_entries[trace_index];
++            std::fprintf(stderr,
++                         "[UB trace commit] slot=%u id=%u dist=%.6f\n",
++                         impl_->key.query_slot, trace_entry.id,
++                         static_cast<double>(trace_entry.distance));
++          }
++        }
+         impl_->state = QueryState::kReadyLayer0Expand;
+         break;
+       }

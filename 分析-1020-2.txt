@@ -1,0 +1,44 @@
+先认账：数据面（向量读）是好的，我的"二次注册"假说撤回
+seg=1（vectors）的 read：off=206215680 = 53702 × 3840，正是 shard 6 里 local_id 53702 的向量；cr_status=0、all_zero=0、float 解出来是 ~0.03 量级的正常分量。你的 2-SN 分析也对（missing=3 来自 shard == local_rank 这条假设，local_rank=0/4）。
+
+两点补充判断：
+
+"同一 peer 同一 off 读两次" 只说明同一 node 被请求两次。可能是同一 query 的两个 phase 重复展开（visited 失效），也可能是两条不同 query 恰好都经过它。这本身不足以定罪，但它是"visited/去重"这条线的第一根线索，先记下。
+但你还漏了最关键的一半数据面：seg=0（graph 邻居表）。你采样到的是 seg=1。graph 段的 offset 在 local_count × M0 × 4 范围内（M0≈64 时约 32MB，而向量段是 480MB），完全不同的区间。graph 读错 → 邻居列表是垃圾 id → 距离都"算得出来"、读也都"成功"，但游走随机 → recall 1e-3，且没有任何报错。 这与你现在的全部观察一致，也解释了为什么向量采样看起来正常。
+立刻能做、且能一锤定音的三个检查
+G1｜graph 读采样（最重要，30 秒）
+
+bash
+
+
+grep -h 'UB PostRead' /tmp/inst2-sn_0.log | grep 'seg=0' | head -10
+grep -h 'UB PostRead' /tmp/inst2-sn_0.log | grep 'seg=1' | head -3   # 对照：你已验证正常的那类
+判读：
+
+seg=0 的 off	含义
+< 32MB 且 off % (M0*4) == 0	offset 形状对，继续看内容
+落在几百 MB	graph 读用了向量段的 offset（或反之） → 段/role 映射错了 → 直接就是 bug
+和 seg=1 的 off 一样	同上，映射串了
+G2｜把 graph 读回的 16 字节当 id 解
+
+graph 邻居表里存的是 node_id_t（u32）。取一条 seg=0 的 first16，解成 4 个 u32：
+
+都必须 < ntotal（1,000,000）；
+若这条读属于 peer shard j，理想情况下大多数 id 落在 [shard_j.global_begin, +125000)（跨片边允许少数越界，但绝不会是随机大数）；
+如果解出 0xFFFFFFFF、超 ntotal 的大数、或四个都是同一个值 → 读错。
+G3｜客户端侧的距离分布（区分"错区域"和"错距离"）
+
+用同一批 query（最好是 3 条固定的），分别在 8SN 和 1SN+preferLocal=true（已知 0.936）下打印返回的 (ids, distances)：
+
+现象	结论
+8SN 的 distance 量级比 1SN 大很多 / 几乎相等 / 全是同一个值	距离算错（向量读错或 metric 错）
+8SN 的距离量级正常，但 id 完全不同、且 id 分布在某个 1/8 区间	游走只在局部 → graph 读或 visited/entry 问题
+8SN 返回里有 -1 或 +inf	是 proxy reduce 把占位行合进来了（这条能直接排除/确认我之前怀疑的 reduce 分支）
+如果 G1/G2 指向"graph 读错"，那 1SN 为什么没错？
+因为 1SN+8QN 里 peer 是普通 worker QN，而 8SN 里 peer 是 SN 内嵌 QN——两者发布的 graph 段 有一个差别：UbShardRegions 返回的 graphAddrs[i]/graphBytes[i] 来自 LocalShard::graph_registration_memory()，在 SN 里这块内存随后又被 UrmaResourceBundle::CreateLocal 参与了一次注册（即使向量读没受影响，graph 段的句柄可能受影响）。所以"向量读正常"并不能排除 graph 段的句柄/长度问题 —— 这正是 G1 要验证的。
+
+我建议的下一步（顺序）
+你跑 G1 + G2（不用改代码，30 秒）；
+同时跑 G3（不用改代码，客户端脚本加几行 print）；
+我这边写一个 env 开关的搜索 trace 补丁（UB_TRACE_SEARCH=1 时打印前 ~50 次 expansion：node id、level、邻居数、前 4 个邻居 id、以及它们的距离），这样 1SN 和 8SN 各跑同一条 query 就能 diff 出第一次分叉的位置——这是定位"选路 vs 图数据"最快的手段；
+你那份 2-shard triple + 2 SN 的 bisect 仍然值得做（world_size=2、每 rank 1 shard，完全落在现有模型内），它是唯一能把"单 peer 是否正确"钉死的实验。
