@@ -1,8 +1,22 @@
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/core/status.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/core/status.hpp
+index b25a518..9acadb5 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/core/status.hpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/core/status.hpp
+@@ -20,6 +20,9 @@ enum class StatusCode {
+   kCancelled,
+   kTransportError,
+   kInternalError,
++  // Caller-visible "not ready yet, retry": used when the data plane cannot be
++  // built because the peers have not published their resources.
++  kUnavailable,
+ };
+ 
+ class Status {
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
-index 4c1e2c8..3800c30 100644
+index 4c1e2c8..3ce460c 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
-@@ -188,6 +188,14 @@ class MilvusUbRuntime {
+@@ -188,6 +188,12 @@ class MilvusUbRuntime {
    // control thread consumes completions and applies deadlines instead of
    // walking a fixed query list.
    Status EnableDistributedSearch();
@@ -12,11 +26,20 @@ index 4c1e2c8..3800c30 100644
 +  Status TryEnablePushdown();
 +  // True once EnableDistributedSearch installed the data plane.
 +  bool DistributedEnabled();
-+  // Same, assuming state_mutex_ is already held.
-+  Status EnablePushdownLocked(DistributedState& state);
  
    // B-test diagnostic: PostReads 5 different offsets through lane engine 0
    // from the calling thread, AFTER EnableDistributedSearch has returned.
+@@ -262,6 +268,10 @@ class MilvusUbRuntime {
+ 
+   struct DistributedState;
+ 
++  // Same as TryEnablePushdown, assuming state_mutex_ is already held. Declared
++  // here because DistributedState is a private pimpl type.
++  Status EnablePushdownLocked(DistributedState& state);
++
+   mutable std::mutex state_mutex_;
+ 
+   // Stage 5 thread-group knobs staged from Go via UbSetConfig.
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
 index 4df14d5..3707727 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
@@ -255,7 +278,7 @@ index 3d472a4..0bc5459 100644
      LOG_INFO("UB distributed runtime: URMA data plane active (graph+vectors "
               "via peer segment table, {} remote shards)",
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
-index 69e7c13..cb2d3d3 100644
+index 69e7c13..dea47f3 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
 @@ -6,6 +6,7 @@
@@ -266,10 +289,12 @@ index 69e7c13..cb2d3d3 100644
  
  #include <algorithm>
  #include <chrono>
-@@ -597,3 +598,148 @@ Metric MilvusUbRuntime_MetricFromName(const char* name) {
+@@ -597,3 +598,152 @@ Metric MilvusUbRuntime_MetricFromName(const char* name) {
  }
  
  }  // namespace hnsw_urma
++
++namespace hnsw_urma {
 +
 +// Builds the distance-pushdown data plane. Called once at the end of
 +// EnableDistributedSearchLocked and again, on demand, from TryEnablePushdown():
@@ -415,6 +440,8 @@ index 69e7c13..cb2d3d3 100644
 +  std::lock_guard<std::mutex> lock(state_mutex_);
 +  return distributed_runtime_ != nullptr;
 +}
++
++}  // namespace hnsw_urma
 \ No newline at end of file
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
 index 784b193..e0fcf22 100644
