@@ -1,0 +1,57 @@
+2. expand_batch 到底改了什么
+定义：layer-0 每轮从 candidate heap 里一次取多少个待扩展点（beam width）。一轮的完整链路（search.cpp:1883）：
+
+代码块
+
+
+pop eb 个候选 → 一次图读(eb 个节点的邻接) → route/visited 过滤 → 一次距离阶段(本地+pushdown) → commit 回 heap
+它只在 6 个地方生效：
+
+#	作用点	代码
+1	轮数 ≈ nodes_expanded / eb	search.cpp:1883
+2	NeighborBatch 容量 eb × M0	search.cpp:257
+3	远程邻接预取预算 min(budget, eb)	search.cpp:1105
+4	每轮图读 op 数 = eb（每节点一个 READ）	同上
+5	每轮距离 task/值数（由新发现邻居数决定，不是 eb×M0）	search.cpp:1039 附近
+6	启动 sizing：maximum_batch = M0 × eb → RPC stride / 队列 / 注册内存预算	milvus_distributed_runtime.cpp:1564、config.cpp:749
+1→20 为什么掉那么多：轮数从 ~ef 降到 ef/20。每轮的固定成本（BeginWait/PublishReady 队列跳、RPC mailbox post+poll、JFS post+JFC poll、profile 的 chrono）是几十 µs 量级，ef=200600 → 摊掉 20 倍。所以它不是"read 变快了"，而是等 read 的次数变少了。
+
+3. 它不是 read 时间长的根因——有个硬证据
+read 侧配置是 read_jfs_depth = max(1024, max_active_queries × eb × 2)（config.cpp:711），active=16 时：
+
+eb=20 → 16×20×2 = 640 → 取 max(1024,640) = 1024
+eb=32 → 16×32×2 = 1024 → 取 max(1024,1024) = 1024
+完全一样。 所以：
+
+20→32 时 read 侧参数一个数都没变 → 32 的报错不可能是 read 资源，只能是 distance batch 侧（maximum_batch = M0×eb → RPC request/response stride → 注册内存 / 队列预算）；这也印证了我之前说的"32 是启动期配置算术，与负载无关"。
+20 的收益也不可能来自"read 资源变多"，只能来自 round 数变少。
+决定 read 等待时间的，是这几件事（按影响排序）：
+
+并发 query 数（maxActiveQueries / 行分片）。eb 只能在一个 query 的一轮内部重叠 READ；只有多条 query 同时在飞，才能跨轮重叠 RTT 和排队。这正是刚打完的 P1+P2。
+一轮内的关键路径 = 最慢的那条 lane，不是平均（日志里的 lane_spread_avg）。
+每轮 op 数 vs 批量参数：wr_list_max=8、post_batch=8、poll_batch=16 —— ops/round 超过 8 就说明一轮被切成多个 post/poll 批，每次批都多一个轮询周期。
+排队/背压：slot_full、credit、RpcClientOwner::pending_capacity、request_ring_depth；8× fanout 时同一份远端数据被 8 个进程各拉一遍。
+轮询模式与绑核：read_progress_mode=busy + rpc_progress_spin_us=50；read/rpc 线程是否和 NIC/URMA 中断同 LLC（cpu_layout=llc-spread / cpu_bind）。
+lane↔peer 映射：read_owner_by_rank，2 个 read 线程分 7 个 peer，某个慢 peer 会把该 lane 串行化。
+单节点邻接大小 M0×4B（固定，不可调）。
+4. 用现有日志 10 分钟定位（不用改代码）
+Heartbeat 里已经打好了（每 2s）：
+
+代码块
+
+
+[UB 4bucket] q=N total_avg=..ms exec=..ms A_read=..ms B_defer=..ms C_sched=..ms
+[UB rounds]  read_ops/q=.. rounds/q=.. ops/round=.. A_max=..ms lane_spread_avg=..us lanes_avg=..
+现象	结论	下一步
+A_read 占 total 大头	确实在等读	看下面三行
+rounds/q × eb 远大于 ef	nodes_expanded 远超 ef → eb 越大浪费越多（heap 只有 commit 后才更新，一次 pop eb 个 = 用过期 heap 决策）	降 eb 或查 terminate
+ops/round > 8	一轮被切成多个 post 批	降 eb（让每轮更小）或加 post_batch
+lane_spread_avg ≈ A_read	在等最慢 lane	查绑核/peer 分布（lane↔rank）
+A_max ≫ A_read	偶发 slot_full / 超时	查 read_slot_full_count、jfs depth
+B_defer 大	READ 完成到 kQueued 的发布延迟	deferred-ready / publish 路径
+C_sched 大	search worker 不够/排队	加 threads.search
+rd_sub 涨 rd_cmpl 不涨	read 侧背压	credit / slot_full
+5. 两个必须注意的坑
+config.hpp 和 query_context.hpp 必须成对改，且 config 的 eb ≥ 搜索用的 eb。config.hpp 那个只做启动 sizing（config.hpp:42），真正的搜索宽度来自 SearchParams（Milvus 路径是 milvus_distributed_runtime.cpp:1978 默认构造，取 query_context.hpp 的默认值）。只改 query_context 而 config 还是 1 → PullVectorDistanceOracle::PrepareForWait 的 ids.size() > max_batch_ 直接 kOutOfRange；只改 config 不改 query_context → 能跑但搜索还是 1。
+eb 不是越大越好：它买到的是"少等几次"，代价是"每次等得更多 + 用过期 heap 多扩节点 + 启动预算更大"。20 左右就是拐点；判断拐点的实验是 eb=8/16/20/24 各跑一遍，看 A_read 什么时候不再往下掉、rounds/q × eb 什么时候开始涨（后者涨 = 多花的工作量），别再往上加。
+想真正把 read 等待压下去，顺序应该是：行分片让 8 个 QN 各 125 行（已完成）→ 每 QN 内 maxActiveQueries 8~16 让多条 query 的 READ 互相重叠（需要先解决 P3 的并发挂死）→ 最后才是调 eb / post_batch / 绑核。
