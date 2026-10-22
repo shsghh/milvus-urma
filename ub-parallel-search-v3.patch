@@ -1,0 +1,2451 @@
+diff --git a/internal/core/src/index/ub_hnsw/ubcgo/ub_cgo.go b/internal/core/src/index/ub_hnsw/ubcgo/ub_cgo.go
+index 613b138..2807127 100644
+--- a/internal/core/src/index/ub_hnsw/ubcgo/ub_cgo.go
++++ b/internal/core/src/index/ub_hnsw/ubcgo/ub_cgo.go
+@@ -26,6 +26,19 @@ type UbSearchEntryResult struct {
+ 	Dists  []float32
+ }
+ 
++// StatusError carries the hnsw_urma StatusCode returned by a C ABI call so
++// callers can tell "not supported in this mode" (kInvalidArgument) from
++// "timed out" without parsing strings. Numeric values come from
++// hnsw_urma/core/status.hpp.
++type StatusError struct {
++	Op   string
++	Code int
++}
++
++func (e *StatusError) Error() string {
++	return fmt.Sprintf("ubcgo: %s failed with status %d", e.Op, e.Code)
++}
++
+ // UbSearchEntry routes the query by reqID % S (main-rank rotation) and,
+ // when this QN is the main rank, runs the global full-graph search.
+ // nq must be 1; loop per query in the caller.
+@@ -63,7 +76,7 @@ func UbSearchEntry(reqID uint64, query []float32, nq int, dim int, topk int,
+ 		&ids[0], &dists[0], &isMain)
+ 
+ 	if code := int(ret); code != 0 {
+-		return fmt.Errorf("ub search entry failed with status %d", code)
++		return &StatusError{Op: "search entry", Code: code}
+ 	}
+ 	out.IsMain = isMain != 0
+ 	if out.IsMain {
+@@ -116,7 +129,7 @@ func UbSearchEntryAsMain(reqID uint64, query []float32, nq int, dim int, topk in
+ 		&ids[0], &dists[0])
+ 
+ 	if code := int(ret); code != 0 {
+-		return fmt.Errorf("ub search entry as main failed with status %d", code)
++		return &StatusError{Op: "search entry as main", Code: code}
+ 	}
+ 	// force_main=true path always sets is_main=true on success.
+ 	out.IsMain = true
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
+index 2abcde0..a38003c 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
+@@ -259,6 +259,20 @@ class MilvusUbRuntime {
+     // to max(1024, max_active_queries * expand_batch * 2)). Override when
+     // raising max_active_queries so the slot pool has headroom.
+     std::uint32_t read_jfs_depth{0};
++    // Startup memory ceilings for the plan BuildRuntimeQueuePlan /
++    // BuildRpcMemoryPlan produce (config.hpp queue_memory_budget_bytes and
++    // registered_rpc_memory_budget_bytes). 0 keeps the built-in default.
++    // Both scale with maximum_batch = M0 * expand_batch, so raising
++    // expand_batch needs these raised as well.
++    std::uint64_t queue_memory_budget_bytes{0};
++    std::uint64_t registered_rpc_memory_budget_bytes{0};
++    // Per-query wall clock and per-attempt (phase) budget. 0 keeps the
++    // built-in defaults (30s / 5s). A large nq batch is only bounded by
++    // query_timeout: with maxActiveQueries=1 a 125-row slice costs
++    // 125 * per-query latency, so raise this before concluding that the
++    // runtime is stuck.
++    std::uint32_t query_timeout_ms{0};
++    std::uint32_t operation_timeout_ms{0};
+   };
+ 
+   // Returns a snapshot of the staged knobs (thread-safe). Values are those
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
+index f047e1b..2b6f95c 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
+@@ -57,7 +57,14 @@ struct MilvusUbRuntime::DistributedState {
+     std::uint32_t topk{10};
+     std::uint32_t ef_search{64};
+     std::vector<float> query;
+-    Completion* completion{nullptr};
++    // Shared, not raw: the submitter may give up waiting (deadline) while the
++    // control lane still holds the object until it signals it. A raw pointer
++    // forced the submitter to wait forever to avoid a use-after-free.
++    std::shared_ptr<Completion> completion;
++    // Control lane fails a queued row that never got admitted within the
++    // query timeout; the per-query deadline only starts at admission, so
++    // without this a wedged runtime parks the submitter forever.
++    std::chrono::steady_clock::time_point enqueued_at{};
+   };
+ 
+   struct Slot {
+@@ -66,9 +73,16 @@ struct MilvusUbRuntime::DistributedState {
+     std::atomic<HnswSearchTask*> task{nullptr};
+     std::atomic<std::uint32_t> readers{0};
+     bool deadline_expired{false};
+-    // Caller-owned completion state (SearchEntry stack frame); null when
+-    // the query was submitted internally (currently unused).
+-    Completion* completion{nullptr};
++    // Control-lane escalation deadline. Set when the query deadline fires;
++    // if the query still has not produced a PopDone by then, the submitter is
++    // detached with a timeout so a wedged owner lane cannot park the caller
++    // forever. The slot itself stays allocated until PopDone arrives, because
++    // owner-lane bindings still point at this task's controller.
++    std::chrono::steady_clock::time_point escalate_after{};
++    // Caller-owned completion state; null when the query was submitted
++    // internally (currently unused). Shared so the submitter can time out
++    // while the lane still needs the object alive.
++    std::shared_ptr<Completion> completion{nullptr};
+     // Concurrency-evidence: admit timestamp (set by control thread under
+     // admission, read by search worker at pickup). Not atomic — the slot
+     // is owned by control until task.store publishes the task, then by
+@@ -176,6 +190,12 @@ struct MilvusUbRuntime::DistributedState {
+   std::deque<PendingQuery> fifo;
+   std::uint32_t max_active_queries{0};
+   std::uint32_t active_queries{0};
++  // Per-query wall clock used by the control lane and by SearchEntry's wait
++  // bound (resolve from RuntimeConfig at enable time).
++  std::uint32_t query_timeout_ms{30000};
++  // Queries reaped (PopDone) since startup: the control lane uses it to tell
++  // "slow" from "wedged" when it reports a stall.
++  std::uint64_t done_total{0};
+   Metric metric{Metric::kL2};
+ 
+   // ---- Concurrency-evidence counters (added for Go worker pool diagnosis).
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
+index 36e08c1..fb5906c 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
+@@ -37,6 +37,21 @@ void UbSetConfig(uint32_t search_workers,
+                  uint32_t max_active_queries,
+                  uint32_t read_jfs_depth);
+ 
++// Stage the startup memory ceilings (bytes) for the UB distributed runtime's
++// queue plan and registered-RPC plan. 0 keeps the built-in default
++// (config.hpp: 1 GiB / 8 GiB). Both plans scale with
++// maximum_batch = M0 * expand_batch, so these are the knobs to raise when
++// expand_batch is increased past what the defaults admit. Must be staged
++// before EnableDistributedSearch; independent of UbSetConfig.
++void UbSetMemoryBudget(uint64_t queue_memory_budget_bytes,
++                       uint64_t registered_rpc_memory_budget_bytes);
++
++// Stage the per-query wall clock and per-attempt phase budget (milliseconds).
++// 0 keeps the built-in defaults (30s / 5s). Both the scheduler deadline and
++// the search task's own deadlines use these, so a long nq batch
++// (maxActiveQueries * per-query latency) is bounded here.
++void UbSetTimeouts(uint32_t query_timeout_ms, uint32_t operation_timeout_ms);
++
+ // Stage 4: shard loading + synchronous local search.
+ //
+ // UbLoadShard moves ownership of an already-loaded hnsw_urma::LoadedIndex
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
+index 0246f83..f757fdc 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
+@@ -50,6 +50,7 @@
+ #include "hnsw_urma/milvus_ub_runtime_impl.hpp"
+ 
+ #include "hnsw_urma/core/status.hpp"
++#include "hnsw_urma/debug_trace.hpp"
+ #include "hnsw_urma/index/format.hpp"
+ #include "hnsw_urma/runtime/config.hpp"
+ #include "hnsw_urma/runtime/counting_notification.hpp"
+@@ -191,6 +192,34 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       requested.rpc_progress_threads.automatic = false;
+     }
+     requested.urma_device = k.urma_device;
++    // Cpu binding / progress mode were staged by Go but never mapped into
++    // the requested config, so the live runtime always used the built-in
++    // defaults (auto bind, busy progress). Map them now.
++    //
++    // cpu_layout is only mapped for the explicit LLC strategies: "contiguous"
++    // (the Go default) keeps CpuLayout::kAuto, which is what every previous
++    // build effectively ran (kAuto discovers the topology and falls back to
++    // contiguous), so mapping it here would silently move threads between
++    // LLCs and invalidate prior measurements.
++    if (!k.cpu_bind_mode.empty()) {
++      requested.cpu_bind =
++          k.cpu_bind_mode == "none" ? CpuBindMode::kNone : CpuBindMode::kAuto;
++    }
++    if (k.cpu_layout == "llc-isolated") {
++      requested.cpu_layout = CpuLayout::kLlcIsolated;
++    } else if (k.cpu_layout == "llc-spread") {
++      requested.cpu_layout = CpuLayout::kLlcSpread;
++    }
++    // progress_mode is one knob for three roles whose built-in defaults are
++    // NOT the same (read/rpc = busy, distance service = adaptive). Only map
++    // the explicit "adaptive" opt-in: mapping "busy" would flip the distance
++    // service from its adaptive default to a busy-spin and change CPU usage
++    // for every existing deployment.
++    if (k.progress_mode == "adaptive") {
++      requested.read_progress_mode = ProgressMode::kAdaptive;
++      requested.rpc_progress_mode = ProgressMode::kAdaptive;
++      requested.distance_progress_mode = ProgressMode::kAdaptive;
++    }
+     // Override the default (16) with the staged knob. 0 means "not set
+     // by Go" → keep the config.hpp default already in requested.
+     if (k.max_active_queries) {
+@@ -200,6 +229,47 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       requested.read_jfs_depth.value = k.read_jfs_depth;
+       requested.read_jfs_depth.automatic = false;
+     }
++    // Startup memory ceilings for the queue / registered-RPC plans. 0 keeps
++    // the config.hpp defaults.
++    if (k.queue_memory_budget_bytes != 0) {
++      requested.queue_memory_budget_bytes = k.queue_memory_budget_bytes;
++    }
++    if (k.registered_rpc_memory_budget_bytes != 0) {
++      requested.registered_rpc_memory_budget_bytes =
++          k.registered_rpc_memory_budget_bytes;
++    }
++    // Deadlines. Keep query >= operation: SearchParams rejects the opposite,
++    // and the scheduler deadline is what bounds a whole nq batch.
++    if (k.operation_timeout_ms != 0) {
++      requested.operation_timeout_ms = k.operation_timeout_ms;
++    }
++    if (k.query_timeout_ms != 0) {
++      requested.query_timeout_ms = k.query_timeout_ms;
++    }
++    if (requested.query_timeout_ms < requested.operation_timeout_ms) {
++      LOG_WARN("UB timeouts: query_timeout_ms={} < operation_timeout_ms={}; "
++               "raising query_timeout_ms to the operation budget",
++               requested.query_timeout_ms, requested.operation_timeout_ms);
++      requested.query_timeout_ms = requested.operation_timeout_ms;
++    }
++  }
++
++  // The distributed search path builds SearchParams from its own defaults
++  // (query_context.hpp), and RuntimeConfig::expand_batch only sizes the
++  // startup plans. If the config is smaller than the batch the search path
++  // actually uses, maximum_batch is undersized and PrepareForWait rejects
++  // batches at run time (kOutOfRange). Size for the larger of the two and
++  // say so, instead of failing later per query.
++  {
++    const std::uint32_t search_expand_batch = SearchParams{}.expand_batch;
++    if (search_expand_batch > requested.expand_batch) {
++      LOG_WARN(
++          "UB expand_batch: config={} is below the search default={}; "
++          "sizing startup plans (JFS depth, queue/RPC budgets, "
++          "maximum_batch=M0*{}) for the search default",
++          requested.expand_batch, search_expand_batch, search_expand_batch);
++      requested.expand_batch = search_expand_batch;
++    }
+   }
+ 
+   std::vector<std::uint32_t> allowed_cpus = knobs_.allowed_cpus;
+@@ -239,6 +309,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+   state->effective = std::move(effective).value();
+   const auto* cfg = &*state->effective;
+   state->max_active_queries = requested.max_active_queries;
++  state->query_timeout_ms = requested.query_timeout_ms;
+   state->metric = readers_metric_;
+   state->eff_search_workers = cfg->search_workers;
+   state->eff_read_progress_threads = cfg->read_progress_threads;
+@@ -1630,10 +1701,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         LOG_INFO("UB M-6 RpcClientOwner::Create begin owner={}/{} lane={}",
+                  owner, cfg->rpc_progress_threads,
+                  cfg->read_progress_threads + owner);
++        // One in-flight query can hold one task per remote peer this owner
++        // serves, so the per-owner in-flight bound must cover every
++        // (query, peer) pair. Sizing it to max_active_queries alone capped a
++        // busy owner at one task per query: with N concurrent queries the
++        // owner rejected (N*peers - N) tasks as kResourceExhausted, which the
++        // search path turns into 50us retry churn instead of progress.
++        const auto served_peers = static_cast<std::uint32_t>(
++            std::max<std::size_t>(1U, owner_map.value().rpc_owned_ranks[owner].size()));
++        const std::uint64_t pending_bound_64 =
++            static_cast<std::uint64_t>(requested.max_active_queries) *
++            served_peers;
++        const auto owner_pending_capacity = static_cast<std::uint32_t>(
++            std::min<std::uint64_t>(
++                pending_bound_64,
++                std::max<std::uint64_t>(
++                    1U, std::numeric_limits<std::uint32_t>::max())));
+         auto client = RpcClientOwner::Create(
+             owner, world_size, max_client_operations,
+             state->rpc_distance->submissions(),
+-            requested.max_active_queries, requested.profile,
++            owner_pending_capacity, requested.profile,
+             state->rpc_distance.get());
+         if (!client.ok()) {
+           LOG_ERROR("UB M-6 RpcClientOwner::Create failed owner={}: {}",
+@@ -1792,6 +1879,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+     // Concurrency-evidence baseline for rate calculation.
+     std::uint64_t last_admit = 0, last_tasks = 0;
+     std::uint64_t last_read_sub = 0, last_read_cmpl = 0;
++    // Stall handling: a timed-out query gets kEscalateGracePeriod for its
++    // owner lanes to converge before the submitter is detached, and a stall
++    // report is emitted at most once per kStallReportInterval while nothing
++    // completes.
++    constexpr auto kEscalateGracePeriod = std::chrono::seconds(2);
++    constexpr auto kStallReportInterval = std::chrono::seconds(2);
++    std::uint64_t last_done_total = 0;
++    auto last_stall_report = std::chrono::steady_clock::now();
+     // Aggregate read counters across read_progress dispatchers.
+     auto read_agg = [&]() -> std::pair<std::uint64_t, std::uint64_t> {
+       std::uint64_t s = 0, c = 0;
+@@ -1806,6 +1901,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+     };
+     while (!stop.stop_requested()) {
+       bool progressed = false;
++      const auto now = std::chrono::steady_clock::now();
+       auto hb_now = std::chrono::steady_clock::now();
+       if (hb_now - last_heartbeat > std::chrono::seconds(2)) {
+         const auto fifo_sz = [&]{ std::lock_guard<std::mutex> g(ctx->fifo_mutex); return ctx->fifo.size(); }();
+@@ -1899,48 +1995,73 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       while (auto done = ctx->queues->PopDone()) {
+         const auto slot_index = done->query.query_slot;
+         if (slot_index >= ctx->slot_records.size()) {
+-          return Status(StatusCode::kProtocolError,
+-                        "done handle references a QuerySlot outside the pool");
++          // Never tear the runtime down for one bad handle: RecordFailure
++          // stops EVERY thread, which turns a single protocol slip into a
++          // permanent, silent hang for all later searches.
++          fprintf(stderr,
++                  "[UB stall] done handle references slot=%u outside the pool "
++                  "(slots=%zu); dropping it\n",
++                  slot_index, ctx->slot_records.size());
++          progressed = true;
++          continue;
+         }
+         auto& record = *ctx->slot_records[slot_index];
+         auto* task = record.task.load(std::memory_order_acquire);
+         if (task == nullptr || task->key() != done->query ||
+             (done->outcome != RunState::kCompleted &&
+              done->outcome != RunState::kFailed)) {
+-          return Status(StatusCode::kProtocolError,
+-                        "done handle is stale or has an unexpected outcome");
++          fprintf(stderr,
++                  "[UB stall] stale done handle slot=%u gen=%llu outcome=%d "
++                  "(task=%p); dropping it\n",
++                  slot_index,
++                  static_cast<unsigned long long>(done->query.generation),
++                  static_cast<int>(done->outcome), static_cast<void*>(task));
++          progressed = true;
++          continue;
+         }
+         if (!record.deadline_expired &&
+             !ctx->deadlines->Cancel(done->query)) {
+-          return Status(StatusCode::kProtocolError,
+-                        "completed query is missing from the deadline heap");
++          fprintf(stderr,
++                  "[UB stall] completed slot=%u is missing from the deadline "
++                  "heap; reaping it anyway\n",
++                  slot_index);
+         }
+         record.task.store(nullptr, std::memory_order_release);
+         while (record.readers.load(std::memory_order_acquire) != 0) {
+           std::this_thread::yield();
+         }
++        // Copy the outcome BEFORE the task is destroyed: `task` points into
++        // record.storage, and resetting it first turned every completion into
++        // a use-after-free read of status()/result().
++        Status final_status = task->status();
++        SearchResult final_result = task->result();
+         record.storage.reset();
+-        if (record.completion != nullptr) {
+-          auto* completion = record.completion;
+-          record.completion = nullptr;
++        if (record.completion) {
++          auto completion = record.completion;
++          record.completion.reset();
+           std::lock_guard<std::mutex> guard(completion->mutex);
+           completion->done = true;
+           completion->success = done->outcome == RunState::kCompleted;
+-          completion->status = task->status();
++          completion->status = std::move(final_status);
+           if (!completion->success) {
+             fprintf(stderr, "[UB EnableDistributed] task done outcome=%d code=%d full=%s\n",
+                     static_cast<int>(done->outcome),
+                     static_cast<int>(completion->status.code()),
+                     completion->status.ToString().c_str());
+           }
+-          completion->result = task->result();
++          completion->result = std::move(final_result);
+           completion->cv.notify_all();
+         }
+         auto released = ctx->slots->Release(done->query);
+         if (!released.ok()) {
+-          return released;
++          // Slot accounting slipped; keep the runtime alive (a dead control
++          // lane hangs every search) and let the stall report expose it.
++          fprintf(stderr, "[UB stall] slot release failed: %s\n",
++                  released.ToString().c_str());
+         }
++        record.escalate_after = std::chrono::steady_clock::time_point{};
+         --ctx->active_queries;
++        ++ctx->done_total;
+         progressed = true;
+       }
+ 
+@@ -1954,7 +2075,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+           }
+           pending = std::move(ctx->fifo.front());
+           ctx->fifo.pop_front();
+-          fprintf(stderr, "[UB ctrl] popped req_id=%llu topk=%u ef=%u qsz=%zu dim=%u active=%u/%u\n",
++          UB_TRACE_LOG("[UB ctrl] popped req_id=%llu topk=%u ef=%u qsz=%zu dim=%u active=%u/%u\n",
+                   static_cast<unsigned long long>(pending.req_id),
+                   pending.topk, pending.ef_search,
+                   pending.query.size(), meta->dim,
+@@ -1967,12 +2088,32 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+                   static_cast<int>(key.status().code()),
+                   key.status().message().c_str());
+           if (key.status().code() == StatusCode::kResourceExhausted) {
++            // No slot right now: put the popped query back at the head of the
++            // queue. Dropping it would leave the submitter (which waits on
++            // every row it pushed) parked forever.
++            std::lock_guard<std::mutex> guard(ctx->fifo_mutex);
++            ctx->fifo.push_front(std::move(pending));
+             break;
+           }
+-          return key.status();
++          // Non-retryable: fail the submitter instead of leaving it parked,
++          // then keep the control lane alive (its death would hang every
++          // later search).
++          if (pending.completion) {
++            auto completion = pending.completion;
++            std::lock_guard<std::mutex> guard(completion->mutex);
++            completion->done = true;
++            completion->success = false;
++            completion->status = key.status();
++            completion->cv.notify_all();
++          }
++          fprintf(stderr, "[UB stall] slot acquire failed: %s\n",
++                  key.status().ToString().c_str());
++          progressed = true;
++          break;
+         }
+         auto& record = *ctx->slot_records[key.value().query_slot];
+         record.deadline_expired = false;
++        record.escalate_after = std::chrono::steady_clock::time_point{};
+         record.completion = pending.completion;
+ 
+         SearchParams params;
+@@ -1980,6 +2121,13 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         params.ef_search =
+             pending.ef_search < pending.topk ? pending.topk
+                                              : pending.ef_search;
++        // Keep the task's own deadlines in sync with the scheduler's: the
++        // task deadline arm is what makes a stalled phase re-attempt and
++        // eventually fail instead of sitting in BeginWait.
++        params.operation_timeout =
++            std::chrono::milliseconds(requested.operation_timeout_ms);
++        params.query_timeout =
++            std::chrono::milliseconds(requested.query_timeout_ms);
+         params.entry_point = INVALID_NODE_ID;
+         params.entry_level = -1;
+ 
+@@ -2011,7 +2159,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         }
+         record.storage = std::move(created).value();
+         record.task.store(record.storage.get(), std::memory_order_release);
+-        fprintf(stderr, "[UB ctrl] req_id=%llu HnswSearchTask::Create OK slot=%u\n",
++        UB_TRACE_LOG("[UB ctrl] req_id=%llu HnswSearchTask::Create OK slot=%u\n",
+                 static_cast<unsigned long long>(pending.req_id),
+                 key.value().query_slot);
+ 
+@@ -2034,13 +2182,27 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+             std::this_thread::yield();
+           }
+           record.storage.reset();
++          // The submitter waits on this completion for every row it queued;
++          // dropping it here would park that batch forever.
++          if (record.completion) {
++            auto completion = record.completion;
++            record.completion.reset();
++            std::lock_guard<std::mutex> guard(completion->mutex);
++            completion->done = true;
++            completion->success = false;
++            completion->status = Status(
++                StatusCode::kResourceExhausted,
++                "no search worker accepted the query admission");
++            completion->cv.notify_all();
++          }
+           auto released = ctx->slots->Release(key.value());
+           if (!released.ok()) {
+-            return released;
++            fprintf(stderr, "[UB stall] slot release after admission failure: %s\n",
++                    released.ToString().c_str());
+           }
+         } else {
+           ctx->admit_success.fetch_add(1, std::memory_order_relaxed);
+-          fprintf(stderr, "[UB ctrl] req_id=%llu admitted slot=%u cursor=%u active=%u/%u\n",
++          UB_TRACE_LOG("[UB ctrl] req_id=%llu admitted slot=%u cursor=%u active=%u/%u\n",
+                   static_cast<unsigned long long>(pending.req_id),
+                   key.value().query_slot, admission_cursor,
+                   ctx->active_queries+1,
+@@ -2079,8 +2241,43 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         progressed = true;
+       }
+ 
++      // 2b. Fail rows that sat in the queue past the query timeout. Their
++      // submitter is still parked in SearchEntry, and the per-query deadline
++      // only starts at admission, so a wedged runtime would otherwise keep
++      // them (and the caller) waiting forever.
++      while (true) {
++        DistributedState::PendingQuery stale;
++        {
++          std::lock_guard<std::mutex> guard(ctx->fifo_mutex);
++          if (ctx->fifo.empty() ||
++              now - ctx->fifo.front().enqueued_at < query_timeout) {
++            break;
++          }
++          stale = std::move(ctx->fifo.front());
++          ctx->fifo.pop_front();
++        }
++        if (stale.completion) {
++          auto completion = stale.completion;
++          std::lock_guard<std::mutex> guard(completion->mutex);
++          completion->done = true;
++          completion->success = false;
++          completion->status = Status(
++              StatusCode::kTimeout,
++              "UB query stayed queued past its timeout without admission");
++          completion->cv.notify_all();
++        }
++        fprintf(stderr,
++                "[UB stall] dropped queued req_id=%llu after %lldms without "
++                "admission (active=%u/%u)\n",
++                static_cast<unsigned long long>(stale.req_id),
++                static_cast<long long>(
++                    std::chrono::duration_cast<std::chrono::milliseconds>(
++                        now - stale.enqueued_at).count()),
++                ctx->active_queries, ctx->max_active_queries);
++        progressed = true;
++      }
++
+       // 3. Expire overdue queries.
+-      const auto now = std::chrono::steady_clock::now();
+       while (auto expired = ctx->deadlines->PopExpired(now)) {
+         auto& record = *ctx->slot_records[expired->query.query_slot];
+         auto* task = record.task.load(std::memory_order_acquire);
+@@ -2089,10 +2286,98 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+           (void)task->RequestFailure(TerminalOutcome::kTimedOut,
+                                      StatusCode::kTimeout);
+           record.deadline_expired = true;
++          // The failure intent alone does not reschedule a parked query: it
++          // only takes effect when an owner lane converges and publishes the
++          // ready handle. Give the lanes a grace period, then detach the
++          // submitter (3b) so a wedged lane cannot park the gRPC caller.
++          record.escalate_after = now + kEscalateGracePeriod;
+           progressed = true;
+         }
+       }
+ 
++      // 3b. Escalate queries that outlived the deadline plus the grace
++      // period. Only the submitter is detached here: the task, its controller
++      // and its slot stay alive until PopDone, because owner lanes may still
++      // hold bindings pointing at them.
++      for (std::size_t index = 0; index < ctx->slot_records.size(); ++index) {
++        auto& record = *ctx->slot_records[index];
++        if (record.escalate_after == std::chrono::steady_clock::time_point{} ||
++            now < record.escalate_after) {
++          continue;
++        }
++        record.escalate_after = std::chrono::steady_clock::time_point{};
++        auto completion = record.completion;
++        if (!completion) {
++          continue;
++        }
++        record.completion.reset();
++        auto* task = record.task.load(std::memory_order_acquire);
++        fprintf(stderr,
++                "[UB stall] escalating slot=%u state=%d run=%d status=%d: "
++                "deadline + grace expired without a done handle; returning "
++                "timeout to the submitter (slot stays until the lanes drain)\n",
++                static_cast<unsigned>(index),
++                task == nullptr ? -1 : static_cast<int>(task->query_state()),
++                task == nullptr ? -1 : static_cast<int>(task->run_state()),
++                task == nullptr ? -1 : static_cast<int>(task->status().code()));
++        std::lock_guard<std::mutex> guard(completion->mutex);
++        completion->done = true;
++        completion->success = false;
++        completion->status = Status(
++            StatusCode::kTimeout,
++            "UB query stalled past its deadline; owner lanes never completed");
++        completion->cv.notify_all();
++        progressed = true;
++      }
++
++      // 3c. Stall report: admitted queries with no done handle for a while.
++      // Emitted at most once per kStallReportInterval and only while wedged.
++      if (ctx->active_queries > 0 && ctx->done_total == last_done_total) {
++        if (now - last_stall_report >= kStallReportInterval) {
++          last_stall_report = now;
++          fprintf(stderr, "[UB stall] active=%u/%u done_total=%llu: no query "
++                  "completed since the last report\n",
++                  ctx->active_queries, ctx->max_active_queries,
++                  static_cast<unsigned long long>(ctx->done_total));
++          for (std::size_t index = 0; index < ctx->slot_records.size();
++               ++index) {
++            auto& record = *ctx->slot_records[index];
++            auto* task = record.task.load(std::memory_order_acquire);
++            if (task == nullptr) {
++              continue;
++            }
++            const auto& controller = task->run_controller();
++            fprintf(stderr,
++                    "[UB stall] slot=%u gen=%llu qstate=%d run=%d pending=%u "
++                    "wait_epoch=%llu escalated=%d\n",
++                    static_cast<unsigned>(index),
++                    static_cast<unsigned long long>(task->key().generation),
++                    static_cast<int>(task->query_state()),
++                    static_cast<int>(task->run_state()),
++                    controller.pending(),
++                    static_cast<unsigned long long>(controller.wait_epoch()),
++                    static_cast<int>(record.escalate_after !=
++                                     std::chrono::steady_clock::time_point{}));
++          }
++          if (ctx->rpc_distance != nullptr) {
++            const auto profile = ctx->rpc_distance->profile();
++            fprintf(stderr,
++                    "[UB stall] rpc submitted=%llu completed=%llu timed_out=%llu "
++                    "cancelled=%llu failed=%llu slots_in_use=%llu audits=%llu\n",
++                    static_cast<unsigned long long>(profile.submitted),
++                    static_cast<unsigned long long>(profile.completed),
++                    static_cast<unsigned long long>(profile.timed_out),
++                    static_cast<unsigned long long>(profile.cancelled),
++                    static_cast<unsigned long long>(profile.failed),
++                    static_cast<unsigned long long>(profile.slots_in_use),
++                    static_cast<unsigned long long>(profile.active_audit_passes));
++          }
++        }
++      } else {
++        last_stall_report = now;
++      }
++      last_done_total = ctx->done_total;
++
+       // 4. Idle wait when nothing moved.
+       if (!progressed) {
+         std::unique_lock<std::mutex> guard(ctx->fifo_mutex);
+@@ -2107,6 +2392,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+     SetCurrentDistanceSearchWorker(worker);
+     auto last_heartbeat = std::chrono::steady_clock::now();
+     std::uint64_t pop_attempts = 0;
++    std::uint64_t worker_errors = 0;
+     fprintf(stderr, "[UB search worker=%u] starting\n", worker);
+     while (!stop.stop_requested()) {
+       // Drain RPC distance completion queues for this search worker.
+@@ -2118,7 +2404,17 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         auto lifecycle = ctx->rpc_distance->ProgressSearch(
+             worker, 64, std::chrono::steady_clock::now());
+         if (!lifecycle.ok()) {
+-          return lifecycle.status();
++          // Never retire this worker on a completion error: if every search
++          // worker returned, every admitted query would stay parked forever
++          // (admitted + waiting, nothing progresses) — the exact shape of the
++          // "cgo concurrency" hang. Log (rate limited) and keep working.
++          ++worker_errors;
++          if (worker_errors <= 10 || (worker_errors % 1000) == 0) {
++            fprintf(stderr,
++                    "[UB search worker=%u] ProgressSearch failed (%llu): %s\n",
++                    worker, static_cast<unsigned long long>(worker_errors),
++                    lifecycle.status().ToString().c_str());
++          }
+         }
+       }
+       // Drain this search worker's own deferred-ready ring. Mixed local +
+@@ -2140,7 +2436,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         std::this_thread::sleep_for(std::chrono::microseconds(200));
+         continue;
+       }
+-      fprintf(stderr, "[UB search worker=%u] GOT runnable slot=%u source=%d\n",
++      UB_TRACE_LOG("[UB search worker=%u] GOT runnable slot=%u source=%d\n",
+               worker, runnable->query.query_slot,
+               static_cast<int>(runnable->source));
+       if (runnable->query.query_slot >= ctx->slot_records.size()) {
+@@ -2210,7 +2506,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+                   record.pickup_ts - record.last_yield_ts).count();
+         }
+       }
+-      fprintf(stderr, "[UB search worker %u] got task slot=%u\n",
++      UB_TRACE_LOG("[UB search worker %u] got task slot=%u\n",
+               worker, runnable->query.query_slot);
+       ctx->loads->Publish(worker,
+                           {ctx->queues->input_backlog(worker), true});
+@@ -2221,7 +2517,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         const auto step = task->Step();
+         const auto step_end_ts = std::chrono::steady_clock::now();
+         if (step_count < 5 || (step_count % 100) == 0) {
+-          fprintf(stderr, "[UB search worker %u] slot=%u step=%d run_state=%d step#=%d\n",
++          UB_TRACE_LOG("[UB search worker %u] slot=%u step=%d run_state=%d step#=%d\n",
+                   worker, runnable->query.query_slot,
+                   static_cast<int>(step),
+                   static_cast<int>(task->run_state()),
+@@ -2338,9 +2634,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+             static_cast<const void*>(ctx->local_shard_for_rpc));
+     auto& server = *ctx->rpc_server;
+     const LocalShard& local_shard = *ctx->local_shard_for_rpc;
++    std::uint64_t worker_errors = 0;
+     while (!stop.stop_requested()) {
+       auto ingress = server.ProgressServiceIngress(worker);
+-      if (!ingress.ok()) return ingress.status();
++      if (!ingress.ok()) {
++        // A distance worker must not retire on a transient ingress error:
++        // with none left, every peer's distance request stalls and the main
++        // QN waits on it forever. Log (rate limited) and keep serving.
++        ++worker_errors;
++        if (worker_errors <= 10 || (worker_errors % 1000) == 0) {
++          fprintf(stderr,
++                  "[UB distance %u] ProgressServiceIngress failed (%llu): %s\n",
++                  worker, static_cast<unsigned long long>(worker_errors),
++                  ingress.status().ToString().c_str());
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        continue;
++      }
+       auto slot_opt = server.PopService(worker);
+       if (!slot_opt.has_value()) {
+         std::this_thread::sleep_for(std::chrono::microseconds(20));
+@@ -2355,10 +2665,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       if (!compute_status.ok()) {
+         auto pub = server.PublishResult(
+             worker, slot, compute_status.code());
+-        if (!pub.ok()) return pub;
++        if (!pub.ok()) {
++          ++worker_errors;
++          if (worker_errors <= 10 || (worker_errors % 1000) == 0) {
++            fprintf(stderr,
++                    "[UB distance %u] PublishResult failed (%llu): %s\n",
++                    worker, static_cast<unsigned long long>(worker_errors),
++                    pub.ToString().c_str());
++          }
++        }
+       } else {
+         auto pub = server.PublishResult(worker, slot);
+-        if (!pub.ok()) return pub;
++        if (!pub.ok()) {
++          ++worker_errors;
++          if (worker_errors <= 10 || (worker_errors % 1000) == 0) {
++            fprintf(stderr,
++                    "[UB distance %u] PublishResult failed (%llu): %s\n",
++                    worker, static_cast<unsigned long long>(worker_errors),
++                    pub.ToString().c_str());
++          }
++        }
+       }
+     }
+     return Status::Ok();
+@@ -2455,6 +2781,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+     }
+     auto last_hb = std::chrono::steady_clock::now();
+     std::uint64_t last_submitted = 0, last_completed = 0;
++    std::uint64_t worker_errors = 0;
+     auto last_activity = std::chrono::steady_clock::now();
+     const auto spin_budget =
+         std::chrono::microseconds(cfg->read_progress_spin_us);
+@@ -2466,6 +2793,19 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       const auto activity_after =
+           ReadActivityValue(ctx->dispatchers[thread]->profile());
+       const auto iteration_finished = std::chrono::steady_clock::now();
++      // A read lane must not retire on a progress error: with no lane left,
++      // every graph/vector READ stalls forever. Log (rate limited) and keep
++      // polling; the rest of the iteration still runs so deferred ready
++      // entries keep getting flushed.
++      if (!status.ok()) {
++        ++worker_errors;
++        if (worker_errors <= 10 || (worker_errors % 1000) == 0) {
++          fprintf(stderr,
++                  "[UB read_progress %u] Progress failed (%llu): %s\n",
++                  thread, static_cast<unsigned long long>(worker_errors),
++                  status.ToString().c_str());
++        }
++      }
+       const auto hb_now2 = std::chrono::steady_clock::now();
+       if (hb_now2 - last_hb > std::chrono::seconds(2)) {
+         const auto& prof = ctx->dispatchers[thread]->profile();
+@@ -2481,9 +2821,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         last_hb = hb_now2;
+       }
+       (void)ctx->ready_publisher->Flush(thread, cfg->search_workers);
+-      if (!status.ok()) {
+-        return status;
+-      }
+       if (activity_after != activity_before) {
+         last_activity = iteration_finished;
+       } else if (auto* ready =
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
+index 92f8a39..c77d304 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
+@@ -286,13 +286,11 @@ Status MilvusUbRuntime::SearchEntry(std::uint64_t req_id,
+                                     bool force_main) {
+   // State checks + dedupe under state_mutex_; release before the
+   // completion wait so concurrent SearchEntry callers are not serialized
+-  // by this lock. The completion object is stack-local per query, so the
+-  // wait itself needs no state_mutex_ protection.
++  // by this lock. Completions are owned by this call (one per row) and the
++  // control lane drops its pointer before signalling.
+   DistributedState* dist_ctx = nullptr;
+-  std::chrono::steady_clock::time_point _tA;
+   {
+     std::lock_guard<std::mutex> lock(state_mutex_);
+-    _tA = std::chrono::steady_clock::now();
+     out_is_main = false;
+     out_ids.assign(static_cast<std::size_t>(nq) * topk,
+                    static_cast<std::int64_t>(INVALID_NODE_ID));
+@@ -354,48 +352,97 @@ Status MilvusUbRuntime::SearchEntry(std::uint64_t req_id,
+   // ---- state_mutex_ released ----
+ 
+   if (dist_ctx != nullptr) {
++    // Batch entry. Every row of this call is pushed into the fifo first and
++    // only then awaited. The previous push-one/wait-one loop serialized the
++    // whole batch behind a single in-flight query, so a QN could never run
++    // more than one query at a time no matter how many rows the caller sent;
++    // the scheduler (max_active_queries x search_workers) only provides
++    // concurrency once the rows are actually queued.
++    constexpr std::uint32_t kMaxBatchRows = 4096;
++    // Caller-side grace on top of the per-query deadline. The control lane
++    // fails a wedged query at query_timeout + 2s; this bound only exists so a
++    // wedged runtime can never park the gRPC thread forever.
++    constexpr std::uint32_t kBatchGraceMs = 5000;
++    if (nq > kMaxBatchRows) {
++      return Status(StatusCode::kInvalidArgument,
++                    "UB SearchEntry batch exceeds the per-call row limit");
++    }
++    if (nq == 0) {
++      return Status::Ok();
++    }
++    const auto started_at = std::chrono::steady_clock::now();
++    // Completion is shared: the submitter may abandon its wait at the
++    // deadline while the control lane still holds the object until it
++    // signals it.
++    std::vector<std::shared_ptr<DistributedState::Completion>> completions;
++    completions.reserve(nq);
+     for (std::uint32_t row = 0; row < nq; ++row) {
+-      const float* src = query.data() + static_cast<std::size_t>(row) * dim;
+-      DistributedState::PendingQuery pending;
+-      pending.req_id = req_id;
+-      pending.topk = topk;
+-      pending.ef_search = ef_search;
+-      pending.query.assign(src, src + dim);
+-      DistributedState::Completion completion;
+-      pending.completion = &completion;
+-      {
+-        std::lock_guard<std::mutex> guard(dist_ctx->fifo_mutex);
++      completions.push_back(std::make_shared<DistributedState::Completion>());
++    }
++    {
++      std::lock_guard<std::mutex> guard(dist_ctx->fifo_mutex);
++      const auto enqueued_at = std::chrono::steady_clock::now();
++      for (std::uint32_t row = 0; row < nq; ++row) {
++        const float* src = query.data() + static_cast<std::size_t>(row) * dim;
++        DistributedState::PendingQuery pending;
++        pending.req_id = req_id;
++        pending.topk = topk;
++        pending.ef_search = ef_search;
++        pending.query.assign(src, src + dim);
++        pending.completion = completions[row];
++        pending.enqueued_at = enqueued_at;
+         dist_ctx->fifo.push_back(std::move(pending));
+-        fprintf(stderr, "[UB SE] req_id=%llu row=%u pushed fifo_size=%zu\n",
+-                static_cast<unsigned long long>(req_id), row,
+-                dist_ctx->fifo.size());
+       }
+-      const auto _tB = std::chrono::steady_clock::now();
+-      dist_ctx->fifo_cv.notify_one();
+-      fprintf(stderr, "[UB SE] req_id=%llu row=%u notified, waiting completion\n",
+-              static_cast<unsigned long long>(req_id), row);
++    }
++    dist_ctx->fifo_cv.notify_one();
++    fprintf(stderr,
++            "[UB SE] req_id=%llu batch nq=%u queued (active=%u/%u), waiting\n",
++            static_cast<unsigned long long>(req_id), nq,
++            dist_ctx->active_queries, dist_ctx->max_active_queries);
++
++    const auto deadline =
++        started_at +
++        std::chrono::milliseconds(dist_ctx->query_timeout_ms) +
++        std::chrono::milliseconds(kBatchGraceMs);
++    Status first_error;
++    for (std::uint32_t row = 0; row < nq; ++row) {
++      auto& completion = *completions[row];
+       std::unique_lock<std::mutex> guard(completion.mutex);
+-      completion.cv.wait(guard, [&] { return completion.done; });
+-      fprintf(stderr, "[UB SE] req_id=%llu row=%u completion done success=%d\n",
+-              static_cast<unsigned long long>(req_id), row,
+-              static_cast<int>(completion.success));
+-      const auto _tE = std::chrono::steady_clock::now();
+-      if (!completion.success) {
+-        return completion.status;
++      if (!completion.cv.wait_until(
++              guard, deadline, [&completion] { return completion.done; })) {
++        fprintf(stderr,
++                "[UB SE] req_id=%llu batch TIMED OUT at row=%u after %lldms "
++                "(active=%u/%u); the control lane will clean up the rest\n",
++                static_cast<unsigned long long>(req_id), row,
++                static_cast<long long>(
++                    std::chrono::duration_cast<std::chrono::milliseconds>(
++                        std::chrono::steady_clock::now() - started_at).count()),
++                dist_ctx->active_queries, dist_ctx->max_active_queries);
++        return Status(StatusCode::kTimeout,
++                      "UB batch entry timed out waiting for the scheduler");
+       }
+-      const auto& neighbors = completion.result.neighbors;
++      if (!completion.success && first_error.ok()) {
++        first_error = completion.status;
++      }
++    }
++    if (!first_error.ok()) {
++      // Every row was awaited, so no completion can still be in flight.
++      return first_error;
++    }
++    for (std::uint32_t row = 0; row < nq; ++row) {
++      const auto& neighbors = completions[row]->result.neighbors;
+       for (std::size_t i = 0; i < neighbors.size() && i < topk; ++i) {
+         out_ids[static_cast<std::size_t>(row) * topk + i] =
+             static_cast<std::int64_t>(neighbors[i].id);
+         out_dists[static_cast<std::size_t>(row) * topk + i] =
+             neighbors[i].distance;
+       }
+-      fprintf(stderr, "[UB Timing] req_id=%llu A_B=%lldms B_E=%lldms A_E=%lldms\n",
+-              static_cast<unsigned long long>(req_id),
+-              std::chrono::duration_cast<std::chrono::milliseconds>(_tB-_tA).count(),
+-              std::chrono::duration_cast<std::chrono::milliseconds>(_tE-_tB).count(),
+-              std::chrono::duration_cast<std::chrono::milliseconds>(_tE-_tA).count());
+     }
++    fprintf(stderr, "[UB SE] req_id=%llu batch nq=%u done in %lldms\n",
++            static_cast<unsigned long long>(req_id), nq,
++            static_cast<long long>(
++                std::chrono::duration_cast<std::chrono::milliseconds>(
++                    std::chrono::steady_clock::now() - started_at).count()));
+     return Status::Ok();
+   }
+ 
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/distance_oracle.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/distance_oracle.cpp
+index 0099f80..62dbc4e 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/distance_oracle.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/distance_oracle.cpp
+@@ -9,6 +9,7 @@
+ #include <string_view>
+ 
+ #include "hnsw_urma/core/checked_math.hpp"
++#include "hnsw_urma/debug_trace.hpp"
+ #include "hnsw_urma/runtime/rpc/transport.hpp"
+ 
+ namespace hnsw_urma {
+@@ -1210,7 +1211,7 @@ Result<std::uint32_t> RpcDistanceOracle::ProgressSearch(
+     if (!event.has_value()) {
+       break;
+     }
+-    fprintf(stderr,
++    UB_TRACE_LOG(
+             "[UB ProgressSearch] popped completion slot=%u ticket=%llu sw=%u\n",
+             event->slot,
+             static_cast<unsigned long long>(event->ticket),
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
+index 01545aa..7d96b47 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
+@@ -11,6 +11,7 @@
+ #include <utility>
+ 
+ #include "hnsw_urma/core/checked_math.hpp"
++#include "hnsw_urma/debug_trace.hpp"
+ #include "hnsw_urma/compute/distance.hpp"
+ 
+ namespace hnsw_urma {
+@@ -1027,7 +1028,7 @@ struct HnswSearchTask::Impl {
+     state = wait_state;
+     SetAttemptDeadline(now);
+     auto compute_local = [&](std::size_t operation) -> Result<bool> {
+-      fprintf(stderr,
++      UB_TRACE_LOG(
+               "[WB cl] enter op=%zu owner=%u key.g=%lu state=%d\n",
+               operation, static_cast<unsigned>(group_owners[operation]),
+               static_cast<unsigned long>(key.generation),
+@@ -1060,7 +1061,7 @@ struct HnswSearchTask::Impl {
+       auto computed = distance_oracle->ComputeLocalTrustedLease(
+           query_lease, owner, local_offsets,
+           std::span<float>(routed_distances).subspan(begin, count));
+-      fprintf(stderr,
++      UB_TRACE_LOG(
+               "[WB cl] exit op=%zu owner=%u ok=%d val=%d code=%d\n",
+               operation, static_cast<unsigned>(owner),
+               static_cast<int>(computed.ok()),
+@@ -1230,14 +1231,14 @@ struct HnswSearchTask::Impl {
+         if (params.profile_timing) {
+           wait_started_nanoseconds = SteadyNowNanoseconds();
+         }
+-        fprintf(stderr,
++        UB_TRACE_LOG(
+                 "[WB bw] pre BeginWait key.g=%lu lanes=%zu has_local=%d defer=%d\n",
+                 static_cast<unsigned long>(key.generation),
+                 phase_lane_counts.size(),
+                 static_cast<int>(has_local),
+                 static_cast<int>(defer_ready));
+         auto waiting = controller.BeginWait(phase_lane_counts, key.generation);
+-        fprintf(stderr,
++        UB_TRACE_LOG(
+                 "[WB bw] post BeginWait key.g=%lu ok=%d epoch=%lu\n",
+                 static_cast<unsigned long>(key.generation),
+                 static_cast<int>(waiting.ok()),
+@@ -1268,13 +1269,13 @@ struct HnswSearchTask::Impl {
+         ScopedProfileTimer timer(
+             local_phase_timer, params.profile_timing,
+             result.timing.remote_prepare_publish_nanoseconds);
+-        fprintf(stderr,
++        UB_TRACE_LOG(
+                 "[WB pp] pre PublishPrepared key.g=%lu ticket=%lu:%lu\n",
+                 static_cast<unsigned long>(key.generation),
+                 static_cast<unsigned long>(record.ticket->generation),
+                 static_cast<unsigned long>(record.ticket->value));
+         auto published = distance_oracle->PublishPrepared(*record.ticket);
+-        fprintf(stderr,
++        UB_TRACE_LOG(
+                 "[WB pp] post PublishPrepared key.g=%lu ok=%d code=%d\n",
+                 static_cast<unsigned long>(key.generation),
+                 static_cast<int>(published.ok()),
+@@ -1321,7 +1322,7 @@ struct HnswSearchTask::Impl {
+         controller.EndDeferredReady();
+       }
+       if (!phase_lane_counts.empty()) {
+-        fprintf(stderr,
++        UB_TRACE_LOG(
+                 "[WB done] key.g=%lu YIELLED remote=%zu local_done=%d\n",
+                 static_cast<unsigned long>(key.generation),
+                 phase_lane_counts.size(),
+@@ -1341,7 +1342,7 @@ struct HnswSearchTask::Impl {
+         }
+         record.harvested = true;
+       }
+-      fprintf(stderr,
++      UB_TRACE_LOG(
+               "[WB done] key.g=%lu COMPLETED local_only harvested=%zu\n",
+               static_cast<unsigned long>(key.generation),
+               distance_operations.size());
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
+index 8280d20..dd5c4bd 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/ub_c_api.cpp
+@@ -109,10 +109,33 @@ void UbSetConfig(uint32_t search_workers,
+     if (!cur.urma_device.empty() && knobs.urma_device.empty()) {
+       knobs.urma_device = cur.urma_device;
+     }
++    // Same for the memory ceilings / timeouts staged by UbSetMemoryBudget
++    // and UbSetTimeouts.
++    knobs.queue_memory_budget_bytes = cur.queue_memory_budget_bytes;
++    knobs.registered_rpc_memory_budget_bytes =
++        cur.registered_rpc_memory_budget_bytes;
++    knobs.query_timeout_ms = cur.query_timeout_ms;
++    knobs.operation_timeout_ms = cur.operation_timeout_ms;
+   }
+   hnsw_urma::MilvusUbRuntime::Instance().SetKnobs(knobs);
+ }
+ 
++void UbSetMemoryBudget(uint64_t queue_memory_budget_bytes,
++                       uint64_t registered_rpc_memory_budget_bytes) {
++  auto knobs = hnsw_urma::MilvusUbRuntime::Instance().GetKnobs();
++  knobs.queue_memory_budget_bytes = queue_memory_budget_bytes;
++  knobs.registered_rpc_memory_budget_bytes =
++      registered_rpc_memory_budget_bytes;
++  hnsw_urma::MilvusUbRuntime::Instance().SetKnobs(knobs);
++}
++
++void UbSetTimeouts(uint32_t query_timeout_ms, uint32_t operation_timeout_ms) {
++  auto knobs = hnsw_urma::MilvusUbRuntime::Instance().GetKnobs();
++  knobs.query_timeout_ms = query_timeout_ms;
++  knobs.operation_timeout_ms = operation_timeout_ms;
++  hnsw_urma::MilvusUbRuntime::Instance().SetKnobs(knobs);
++}
++
+ // Stage 4 ABI trampolines. The C signature uses void* so the header stays
+ // C-compatible; the .cpp casts back to LoadedIndex* (defined in C++).
+ 
+diff --git a/internal/querynodev2/delegator/delegator.go b/internal/querynodev2/delegator/delegator.go
+index 1823592..f25650c 100644
+--- a/internal/querynodev2/delegator/delegator.go
++++ b/internal/querynodev2/delegator/delegator.go
+@@ -567,32 +567,66 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
+ 	// (organizeSubTask / executeSubTasks / SearchOnSealed). Native
+ 	// collections are unaffected.
+ 	//
+-	// P2P forward: the SN-embedded QN (which seeds all 8 shards as
+-	// routing metadata but should NOT run the search itself) picks a
+-	// worker QN round-robin and forwards the SearchSegments gRPC call
+-	// to it. The worker QN's SearchSegments handler detects the UB
+-	// branch and runs RunSearchAsWorker (force_main=true), bypassing
+-	// the native per-segment pipeline.
++	// Row sharding: the proxy sends every vchannel of the collection the same
++	// nq rows. Channel rank r searches only rows i%mod==r, so N QNs work on
++	// disjoint queries in parallel and the proxy reduce merges the partials.
++	//
++	// P2P forward: the SN-embedded QN (which seeds all 8 shards as routing
++	// metadata but should NOT run the search itself) picks a worker QN
++	// round-robin and forwards the SearchSegments gRPC call to it. The worker
++	// QN's SearchSegments handler detects the UB branch and runs
++	// RunSearchAsWorker (force_main=true), bypassing the native per-segment
++	// pipeline. Pure worker QNs run their slice locally.
+ 	//
+ 	// P2P-5: data plane is bootstrapped at QN startup (Register's Phase 2
+ 	// prepareUbSearch); search no longer touches the lazy prepareSearch hook.
+ 	if ub.TrySearch(req.GetReq()) {
+ 		selfNodeID := ub.SelfNodeID()
+ 		candidates := sd.listWorkerCandidates(ctx)
+-		if fwdResult, fwd, ferr := ub.TryForward(ctx, req, selfNodeID, candidates); ferr != nil {
++
++		rowSlice, sliceErr := ub.SliceForChannel(req, sd.collectionID, sd.vchannelName)
++		if sliceErr != nil {
++			log.Warn(ctx, "UB row slicing failed, running the unsliced request", mlog.Err(sliceErr))
++		}
++		searchReq := req
++		if rowSlice != nil {
++			searchReq = rowSlice.Request
++			log.Info(ctx, "UB row sharding",
++				mlog.Int("rank", rowSlice.Rank),
++				mlog.Int("mod", rowSlice.Mod),
++				mlog.Int64("nqIn", rowSlice.NqIn),
++				mlog.Int64("nqOut", rowSlice.NqOut))
++		}
++		// finish maps a slice result back into the full nq row space.
++		finish := func(result *internalpb.SearchResults) []*internalpb.SearchResults {
++			if rowSlice == nil {
++				return []*internalpb.SearchResults{result}
++			}
++			return []*internalpb.SearchResults{ub.ScatterResult(result, rowSlice)}
++		}
++		if rowSlice != nil && rowSlice.NqOut == 0 {
++			// This rank owns no rows for this batch; answer so the proxy
++			// merge is not short a channel.
++			return finish(nil), nil
++		}
++
++		if fwdResult, fwd, ferr := ub.TryForward(ctx, searchReq, selfNodeID, candidates, sd.collectionID, sd.vchannelName); ferr != nil {
+ 			log.Warn(ctx, "UB P2P forward error, falling back to local RunSearchAsWorker", mlog.Err(ferr))
+ 		} else if fwd {
+ 			log.Info(ctx, "UB P2P forward returned result")
+-			return fwdResult, nil
++			return finish(fwdResult), nil
+ 		}
+ 		// Not forwarded: this process is a pure worker QN (chosen
+-		// initiator) OR forwarding was skipped. Run locally.
++		// initiator) OR forwarding was skipped. Run the slice locally.
+ 		log.Info(ctx, "UB fast path entering RunSearchAsWorker",
+ 			mlog.Bool("isSnEmbedded", ub.IsSnEmbeddedQn()),
+ 			mlog.Int64("selfNodeID", selfNodeID))
+-		if result, err := ub.RunSearchAsWorker(ctx, sd.collectionID, req.GetReq()); err == nil {
++		if result, err := ub.RunSearchAsWorker(ctx, sd.collectionID, searchReq.GetReq()); err == nil {
+ 			log.Info(ctx, "UB fast path RunSearchAsWorker OK")
+-			return result, nil
++			if len(result) == 0 {
++				return finish(nil), nil
++			}
++			return finish(result[0]), nil
+ 		} else {
+ 			log.Warn(ctx, "UB fast path RunSearchAsWorker failed, falling back to native", mlog.Err(err))
+ 		}
+diff --git a/internal/querynodev2/server.go b/internal/querynodev2/server.go
+index 74f1750..d356787 100644
+--- a/internal/querynodev2/server.go
++++ b/internal/querynodev2/server.go
+@@ -1501,6 +1501,10 @@ func (node *QueryNode) Init() error {
+ 		// SN-embedded QN forwards searches to worker QNs round-robin;
+ 		// pure worker QNs (1 shard each) run RunSearchAsWorker directly.
+ 		ub.MaybeMarkSnEmbeddedByShardCount(int(initcore.UbLoadedShardCount()))
++		// Row sharding (ub.SliceForChannel) needs the index shard count to
++		// validate that `dmlChannelNum == shard count` before it splits a
++		// client search across vchannels; 0 keeps sharding disabled.
++		ub.SetExpectedShardCount(int(initcore.UbExpectedShardCount()))
+ 		node.RegisterSegcoreConfigWatcher()
+ 
+ 		cleanupOrphanedSpilloverFiles(node.GetNodeID())
+diff --git a/internal/querynodev2/services.go b/internal/querynodev2/services.go
+index 34557f0..e26e4b4 100644
+--- a/internal/querynodev2/services.go
++++ b/internal/querynodev2/services.go
+@@ -268,9 +268,21 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
+ 		return merr.Status(err), nil
+ 	}
+ 	node.delegators.Insert(channel.GetChannelName(), delegator)
++	// UB forward election: record that this process hosts this vchannel so
++	// delegator.Search can forward exactly once per collection instead of
++	// once per channel (see ub.TryForward).
++	ub.RegisterLocalChannel(req.GetCollectionID(), channel.GetChannelName())
++	// Row-sharding activation is decided by the local channel set, so log the
++	// decision here instead of leaving it implicit: modulus 0 means every
++	// channel will search the full nq batch.
++	log.Info(ctx, "UB local channel registered",
++		mlog.Int("localChannels", ub.LocalChannelCount(req.GetCollectionID())),
++		mlog.Int("expectedShardCount", ub.ExpectedShardCount()),
++		mlog.Int("rowShardModulus", ub.ShardModulus(req.GetCollectionID())))
+ 	defer func() {
+ 		if err != nil {
+ 			node.delegators.GetAndRemove(channel.GetChannelName())
++			ub.UnregisterLocalChannel(req.GetCollectionID(), channel.GetChannelName())
+ 			delegator.Close()
+ 		}
+ 	}()
+@@ -414,6 +426,7 @@ func (node *QueryNode) UnsubDmChannel(ctx context.Context, req *querypb.UnsubDmC
+ 			log.Info(ctx, "channel already unsubscribed")
+ 			return merr.Success(), nil
+ 		}
++		ub.UnregisterLocalChannel(req.GetCollectionID(), req.GetChannelName())
+ 		node.pipelineManager.Remove(req.GetChannelName())
+ 		preparedGrowingSourceSegments := syncmgr.DefaultGrowingSourceRegistry().ReleasePreparedSegments(req.GetChannelName())
+ 		// close the delegator first to block all coming query/search requests
+diff --git a/internal/querynodev2/ub/ub_forward.go b/internal/querynodev2/ub/ub_forward.go
+index 56b62a4..cfefcee 100644
+--- a/internal/querynodev2/ub/ub_forward.go
++++ b/internal/querynodev2/ub/ub_forward.go
+@@ -33,6 +33,7 @@ package ub
+ 
+ import (
+ 	"context"
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -91,16 +92,18 @@ func ForwardCounter() uint64 {
+ 	return ubForwardCounter.Load()
+ }
+ 
+-// TryForward attempts the P2P forward path. Returns (results, true, nil)
+-// when a worker QN ran the search; (nil, false, nil) when this process
+-// should run RunSearchAsWorker itself (it IS the chosen initiator);
+-// (nil, false, err) on forwarding error — caller should fall back to
+-// the local RunSearch path.
++// TryForward attempts the P2P forward path. Returns (result, true, nil) when
++// this request was handled by another worker QN, (nil, false, nil) when this
++// process should run the search itself, and (nil, false, err) on a forwarding
++// error so the caller can fall back to a local search.
+ //
+-// req is the *querypb.SearchRequest the delegator received; selfNodeID
+-// is paramtable.GetNodeID(); candidateWorkers is the list of all worker
+-// nodeIDs known to the workerManager (excluding self).
+-func TryForward(ctx context.Context, req *querypb.SearchRequest, selfNodeID int64, candidateWorkers []int64) ([]*internalpb.SearchResults, bool, error) {
++// req is the *querypb.SearchRequest this delegator received — already sliced
++// to this channel's rows when row sharding is active (SliceForChannel).
++// selfNodeID is paramtable.GetNodeID(); candidateWorkers is the worker node
++// set known to the workerManager (excluding self); collectionID/channel
++// identify the receiving delegator.
++func TryForward(ctx context.Context, req *querypb.SearchRequest, selfNodeID int64,
++	candidateWorkers []int64, collectionID int64, channel string) (*internalpb.SearchResults, bool, error) {
+ 	if !Enabled() {
+ 		return nil, false, nil
+ 	}
+@@ -114,9 +117,22 @@ func TryForward(ctx context.Context, req *querypb.SearchRequest, selfNodeID int6
+ 	if len(candidateWorkers) == 0 {
+ 		return nil, false, nil
+ 	}
++	// Without row sharding every channel still carries the full batch, so
++	// collapse the fan-out to one forward per client search and let the other
++	// channels answer with no rows (the proxy reduce merges per query).
++	if _, _, sharded := ChannelRank(collectionID, channel); !sharded &&
++		paramtable.Get().QueryNodeCfg.UbSingleForwarder.GetAsBool() &&
++		!IsElectedForwardChannel(collectionID, channel) {
++		mlog.Info(ctx, "UB P2P forward skipped, non-elected channel",
++			mlog.String("channel", channel),
++			mlog.Int64("collectionID", collectionID),
++			mlog.Int("localChannels", LocalChannelCount(collectionID)),
++			mlog.Int64("nq", req.GetReq().GetNq()))
++		return EmptySearchResults(req.GetReq()), true, nil
++	}
+ 	pick := ubForwardSelector.PickNext(selfNodeID, candidateWorkers)
+ 	if pick == 0 || pick == selfNodeID {
+-		// No valid worker to forward to — fall back to local RunSearch.
++		// No valid worker to forward to — fall back to a local search.
+ 		return nil, false, nil
+ 	}
+ 	cnt := ubForwardCounter.Add(1)
+@@ -130,16 +146,129 @@ func TryForward(ctx context.Context, req *querypb.SearchRequest, selfNodeID int6
+ 			mlog.Err(err))
+ 		return nil, false, err
+ 	}
+-	// ForwardSearch returns a single SearchResults (one worker handles
+-	// the full global search). Wrap in the slice shape delegator.Search
+-	// returns.
+ 	mlog.Info(ctx, "UB P2P forward OK",
+ 		mlog.Int64("selfNodeID", selfNodeID),
+ 		mlog.Int64("targetWorker", pick),
+ 		mlog.Uint64("forwardCounter", cnt),
+ 		mlog.Int64("nq", req.GetReq().GetNq()),
+ 		mlog.Int64("latencyMs", time.Since(t0).Milliseconds()))
+-	return []*internalpb.SearchResults{resp}, true, nil
++	return resp, true, nil
++}
++
++// ---- process-local forwarder election ----------------------------------
++//
++// One client search reaches this process once per collection vchannel (the
++// proxy fans the same nq queries out to every channel leader). Each of those
++// delegator.Search calls used to issue its own P2P forward, so N worker QNs
++// ran the identical global search and the proxy merged N duplicated topk
++// lists. UB search ignores the channel, so exactly one channel per
++// collection may forward; the rest contribute no rows.
++//
++// The election key cannot be the request: internalpb.SearchRequest.ReqID is
++// the proxy node id (constant for every search), which is also why the C++
++// side is entered with force_main=true and cannot use its own
++// `req_id % shard_count` gate here. The channel set of the process is
++// stable while the node holds the same vchannels, so electing the smallest
++// channel name per collection is deterministic and needs no coordination
++// between the N concurrent delegator.Search calls.
++
++type channelSet struct {
++	mu       sync.Mutex
++	channels map[string]struct{}
++}
++
++// ubLocalChannels maps collectionID -> *channelSet of the vchannels whose
++// delegator lives in this process.
++var ubLocalChannels sync.Map
++
++// RegisterLocalChannel records that this process hosts a delegator for
++// channel. Called when a delegator is created.
++func RegisterLocalChannel(collectionID int64, channel string) {
++	if channel == "" {
++		return
++	}
++	v, _ := ubLocalChannels.LoadOrStore(collectionID, &channelSet{
++		channels: make(map[string]struct{}),
++	})
++	set, ok := v.(*channelSet)
++	if !ok {
++		return
++	}
++	set.mu.Lock()
++	set.channels[channel] = struct{}{}
++	set.mu.Unlock()
++}
++
++// UnregisterLocalChannel drops a released channel. A stale registration
++// would elect a channel that no longer receives requests, so both delegator
++// teardown paths call this.
++func UnregisterLocalChannel(collectionID int64, channel string) {
++	v, ok := ubLocalChannels.Load(collectionID)
++	if !ok {
++		return
++	}
++	set, ok := v.(*channelSet)
++	if !ok {
++		return
++	}
++	set.mu.Lock()
++	delete(set.channels, channel)
++	empty := len(set.channels) == 0
++	set.mu.Unlock()
++	if empty {
++		ubLocalChannels.Delete(collectionID)
++	}
++}
++
++// IsElectedForwardChannel reports whether channel is this process's
++// forwarder for collectionID. A process that is not tracked, or that hosts
++// a single channel of the collection, keeps the legacy behaviour (forward).
++func IsElectedForwardChannel(collectionID int64, channel string) bool {
++	v, ok := ubLocalChannels.Load(collectionID)
++	if !ok {
++		return true
++	}
++	set, ok := v.(*channelSet)
++	if !ok {
++		return true
++	}
++	set.mu.Lock()
++	defer set.mu.Unlock()
++	if len(set.channels) <= 1 {
++		return true
++	}
++	elected := ""
++	for c := range set.channels {
++		if elected == "" || c < elected {
++			elected = c
++		}
++	}
++	return elected == channel
++}
++
++// LocalChannelCount reports how many vchannels of collectionID this process
++// hosts. Diagnostic only.
++func LocalChannelCount(collectionID int64) int {
++	v, ok := ubLocalChannels.Load(collectionID)
++	if !ok {
++		return 0
++	}
++	set, ok := v.(*channelSet)
++	if !ok {
++		return 0
++	}
++	set.mu.Lock()
++	defer set.mu.Unlock()
++	return len(set.channels)
++}
++
++// EmptySearchResults builds the "this channel contributes no rows" reply:
++// nq queries, zero topk, empty ids/scores. That is the shape the proxy
++// reduce expects for a channel that produced nothing
++// (checkSearchResultData requires NumQueries/TopK to equal the request and
++// len(Scores) == len(Ids)).
++func EmptySearchResults(req *internalpb.SearchRequest) *internalpb.SearchResults {
++	return emptySearchResult(req.GetNq(), req.GetTopk(), req.GetReqID(), req.GetMetricType())
+ }
+ 
+ // RoundRobinSelector is the default ForwardSelector: stateless modulo
+diff --git a/internal/querynodev2/ub/ub_search.go b/internal/querynodev2/ub/ub_search.go
+index 43caf55..0e50f0e 100644
+--- a/internal/querynodev2/ub/ub_search.go
++++ b/internal/querynodev2/ub/ub_search.go
+@@ -43,6 +43,10 @@ import (
+ 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+ )
+ 
++// ubStatusInvalidArgument mirrors hnsw_urma::StatusCode::kInvalidArgument
++// (hnsw_urma/core/status.hpp). The C ABI returns the enum as an int.
++const ubStatusInvalidArgument = 1
++
+ // SearchRequestMinimal narrows what TrySearch needs from the request proto,
+ // keeping the delegator call site independent from concrete proto types.
+ type SearchRequestMinimal interface {
+@@ -396,8 +400,11 @@ func RunSearchAsWorker(ctx context.Context, collectionID int64, req *internalpb.
+ 	}
+ 	dedupeSeq := uint64(atomic.AddUint64(&reqCounter, 1))
+ 
+-	// Worker pool — same shape as RunSearch. force_main=true means every
+-	// query produces a real result; no IsMain skipping.
++	// Default path: one cgo call carries the whole batch. The C++ entry pushes
++	// every row into the scheduler fifo and waits for all of them, so the
++	// process-wide concurrency comes from search_workers / max_active_queries
++	// instead of from Go threads. UbGoConcurrentQueries > 1 keeps the legacy
++	// per-row cgo pool for A/B comparison.
+ 	workers := paramtable.Get().QueryNodeCfg.UbGoConcurrentQueries.GetAsInt()
+ 	if workers < 1 {
+ 		workers = 1
+@@ -405,56 +412,109 @@ func RunSearchAsWorker(ctx context.Context, collectionID int64, req *internalpb.
+ 	if workers > nq {
+ 		workers = nq
+ 	}
+-	var (
+-		errFlag  atomic.Bool
+-		firstErr error
+-		errMu    sync.Mutex
+-	)
+-	jobs := make(chan int, workers)
+-	var wg sync.WaitGroup
+-	for w := 0; w < workers; w++ {
+-		wg.Add(1)
+-		go func() {
+-			defer wg.Done()
+-			for i := range jobs {
+-				if errFlag.Load() {
+-					continue
+-				}
+-				q := queries[i]
+-				var out ubcgo.UbSearchEntryResult
+-				dedupeKey := dedupeSeq<<32 | uint64(uint32(reqID))
+-				err := ubcgo.UbSearchEntryAsMain(dedupeKey+uint64(i), q, 1, dim,
+-					topkInt, int(ef), metricType, &out)
+-				if err != nil {
+-					errFlag.Store(true)
+-					errMu.Lock()
+-					if firstErr == nil {
+-						firstErr = err
+-					}
+-					errMu.Unlock()
+-					continue
++	if workers == 1 {
++		flat := make([]float32, 0, nq*dim)
++		for _, q := range queries {
++			flat = append(flat, q...)
++		}
++		var out ubcgo.UbSearchEntryResult
++		dedupeKey := dedupeSeq<<32 | uint64(uint32(reqID))
++		// Pin "the cgo call was entered" in the QN log: a hang before this
++		// line is Go-side (plan/placeholder), a hang after it is the C++
++		// scheduler.
++		mlog.Info(ctx, "UB batch entry issuing cgo",
++			mlog.Int("nq", nq), mlog.Int("dim", dim),
++			mlog.Int("topk", topkInt), mlog.Int64("ef", ef))
++		if err := ubcgo.UbSearchEntryAsMain(dedupeKey, flat, nq, dim,
++			topkInt, int(ef), metricType, &out); err != nil {
++			// Only "the batch entry is unavailable in this mode"
++			// (kInvalidArgument: the distributed runtime is not built yet)
++			// is worth a per-row retry. A timeout must NOT be retried row by
++			// row: with nq rows that multiplies the wait by nq.
++			var statusErr *ubcgo.StatusError
++			if !errors.As(err, &statusErr) || statusErr.Code != ubStatusInvalidArgument {
++				return nil, err
++			}
++			mlog.Warn(ctx, "UB batch search entry unavailable, retrying row by row",
++				mlog.Int("nq", nq), mlog.Err(err))
++			for i := 0; i < nq; i++ {
++				var rowOut ubcgo.UbSearchEntryResult
++				if rowErr := ubcgo.UbSearchEntryAsMain(dedupeKey+uint64(i), queries[i], 1, dim,
++					topkInt, int(ef), metricType, &rowOut); rowErr != nil {
++					return nil, rowErr
+ 				}
+-				// force_main=true always sets out.IsMain=true on success.
+ 				base := i * topkInt
+ 				end := base + topkInt
+-				if len(out.Ids) < topkInt {
+-					end = base + len(out.Ids)
++				if len(rowOut.Ids) < end-base {
++					end = base + len(rowOut.Ids)
+ 				}
+ 				for k := 0; k < end-base; k++ {
+-					allIds[base+k] = out.Ids[k]
+-					allDists[base+k] = out.Dists[k]
++					allIds[base+k] = rowOut.Ids[k]
++					allDists[base+k] = rowOut.Dists[k]
+ 				}
+ 				topks[i] = int64(end - base)
+ 			}
+-		}()
+-	}
+-	for i := 0; i < nq; i++ {
+-		jobs <- i
+-	}
+-	close(jobs)
+-	wg.Wait()
+-	if errFlag.Load() {
+-		return nil, firstErr
++		} else {
++			// force_main=true always fills nq*topk entries (short heaps are
++			// padded with -1/+inf by the C++ side), same as the per-row path.
++			copy(allIds, out.Ids)
++			copy(allDists, out.Dists)
++			for i := range topks {
++				topks[i] = int64(topkInt)
++			}
++		}
++	} else {
++		var (
++			errFlag  atomic.Bool
++			firstErr error
++			errMu    sync.Mutex
++		)
++		jobs := make(chan int, workers)
++		var wg sync.WaitGroup
++		for w := 0; w < workers; w++ {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				for i := range jobs {
++					if errFlag.Load() {
++						continue
++					}
++					q := queries[i]
++					var out ubcgo.UbSearchEntryResult
++					dedupeKey := dedupeSeq<<32 | uint64(uint32(reqID))
++					err := ubcgo.UbSearchEntryAsMain(dedupeKey+uint64(i), q, 1, dim,
++						topkInt, int(ef), metricType, &out)
++					if err != nil {
++						errFlag.Store(true)
++						errMu.Lock()
++						if firstErr == nil {
++							firstErr = err
++						}
++						errMu.Unlock()
++						continue
++					}
++					// force_main=true always sets out.IsMain=true on success.
++					base := i * topkInt
++					end := base + topkInt
++					if len(out.Ids) < topkInt {
++						end = base + len(out.Ids)
++					}
++					for k := 0; k < end-base; k++ {
++						allIds[base+k] = out.Ids[k]
++						allDists[base+k] = out.Dists[k]
++					}
++					topks[i] = int64(end - base)
++				}
++			}()
++		}
++		for i := 0; i < nq; i++ {
++			jobs <- i
++		}
++		close(jobs)
++		wg.Wait()
++		if errFlag.Load() {
++			return nil, firstErr
++		}
+ 	}
+ 
+ 	mlog.Info(ctx, "UB worker path search done",
+diff --git a/internal/util/initcore/ub_config.go b/internal/util/initcore/ub_config.go
+index 5522650..1611e40 100644
+--- a/internal/util/initcore/ub_config.go
++++ b/internal/util/initcore/ub_config.go
+@@ -81,6 +81,22 @@ func InitUbRuntime(ctx context.Context) {
+ 		cCpus, C.uint32_t(len(cpus)),
+ 		C.uint32_t(maxActive), C.uint32_t(readJfsDepth))
+ 
++	// Startup memory ceilings for the queue / registered-RPC plans. 0 keeps
++	// the C++ built-in defaults; raise them when expand_batch grows
++	// maximum_batch = M0*expand_batch past what the defaults admit.
++	queueBudget := cfg.UbQueueMemoryBudget.GetAsUint64()
++	rpcBudget := cfg.UbRegisteredRpcMemoryBudget.GetAsUint64()
++	if queueBudget != 0 || rpcBudget != 0 {
++		C.UbSetMemoryBudget(C.uint64_t(queueBudget), C.uint64_t(rpcBudget))
++	}
++	// Deadlines: the per-query wall clock bounds a whole nq batch, so raise it
++	// before concluding that a long batch is stuck.
++	queryTimeoutMs := cfg.UbQueryTimeoutMs.GetAsUint32()
++	operationTimeoutMs := cfg.UbOperationTimeoutMs.GetAsUint32()
++	if queryTimeoutMs != 0 || operationTimeoutMs != 0 {
++		C.UbSetTimeouts(C.uint32_t(queryTimeoutMs), C.uint32_t(operationTimeoutMs))
++	}
++
+ 	mlog.Info(ctx, "UB config staged",
+ 		mlog.Uint32("search", search),
+ 		mlog.Uint32("distance", distance),
+diff --git a/pkg/util/paramtable/component_param.go b/pkg/util/paramtable/component_param.go
+index 6fa7a58..6900cf5 100644
+--- a/pkg/util/paramtable/component_param.go
++++ b/pkg/util/paramtable/component_param.go
+@@ -3762,6 +3762,12 @@ type queryNodeConfig struct {
+ 	UbEnabled          ParamItem `refreshable:"false"`
+ 	UbGoConcurrentQueries ParamItem `refreshable:"true"`
+ 	UbMaxActiveQueries ParamItem `refreshable:"false"`
++	UbSingleForwarder  ParamItem `refreshable:"true"`
++	UbRowSharding      ParamItem `refreshable:"true"`
++	UbQueueMemoryBudget ParamItem `refreshable:"false"`
++	UbRegisteredRpcMemoryBudget ParamItem `refreshable:"false"`
++	UbQueryTimeoutMs   ParamItem `refreshable:"false"`
++	UbOperationTimeoutMs ParamItem `refreshable:"false"`
+ 	UbReadJfsDepth     ParamItem `refreshable:"false"`
+ 	UbSearchWorkers    ParamItem `refreshable:"false"`
+ 	UbDistanceWorkers  ParamItem `refreshable:"false"`
+@@ -5356,6 +5362,84 @@ user-task-polling:
+ 	}
+ 	p.UbMaxActiveQueries.Init(base.mgr)
+ 
++	// UbSingleForwarder makes the SN-embedded QN forward a client search
++	// exactly once per collection instead of once per vchannel. The proxy
++	// splits one search into one SearchRequest per vchannel, and UB search
++	// is global, so the per-channel forwards made N worker QNs run the
++	// identical global search (N x duplicate URMA traffic, N x redundant
++	// CPU) and the proxy merged N identical topk lists. With this on, only
++	// the elected channel of each collection forwards; the others answer
++	// with an empty (topk=0) result. false restores the legacy N-way
++	// forward for A/B comparison.
++	p.UbSingleForwarder = ParamItem{
++		Key:          "queryNode.ub.singleForwarder",
++		Version:      "3.0.0",
++		DefaultValue: "true",
++		Doc:          "forward one UB search per collection instead of one per vchannel; false = legacy per-channel forward",
++		Export:       false,
++	}
++	p.UbSingleForwarder.Init(base.mgr)
++
++	// UbRowSharding splits one client search across the collection's
++	// vchannels: channel rank r searches only query rows i%mod==r, so N QNs
++	// work on disjoint queries in parallel and each QN's C++ scheduler can run
++	// its share concurrently. Requires rootCoord.dmlChannelNum == the UB index
++	// shard count; otherwise sharding stays off and the legacy path (one
++	// forward per collection, see UbSingleForwarder) is used.
++	p.UbRowSharding = ParamItem{
++		Key:          "queryNode.ub.rowSharding",
++		Version:      "3.0.0",
++		DefaultValue: "true",
++		Doc:          "split a client search's nq rows across vchannels by rank (requires dmlChannelNum == shard count); false = every channel searches all rows",
++		Export:       false,
++	}
++	p.UbRowSharding.Init(base.mgr)
++
++	// Startup memory ceilings for the two plans built by
++	// ResolveRuntimeConfig. Both scale with maximum_batch = M0*expand_batch,
++	// so raising expand_batch (query_context.hpp / config.hpp) past what the
++	// built-in defaults admit is exactly when these need raising. 0 keeps the
++	// built-in defaults (config.hpp: 1 GiB queue / 8 GiB registered RPC).
++	p.UbQueueMemoryBudget = ParamItem{
++		Key:          "queryNode.ub.queueMemoryBudgetBytes",
++		Version:      "3.0.0",
++		DefaultValue: "0",
++		Doc:          "startup queue-memory ceiling in bytes for the UB runtime plan; 0 = built-in default (1 GiB)",
++		Export:       false,
++	}
++	p.UbQueueMemoryBudget.Init(base.mgr)
++
++	p.UbRegisteredRpcMemoryBudget = ParamItem{
++		Key:          "queryNode.ub.registeredRpcMemoryBudgetBytes",
++		Version:      "3.0.0",
++		DefaultValue: "0",
++		Doc:          "startup registered-RPC-memory ceiling in bytes for the UB runtime plan; 0 = built-in default (8 GiB)",
++		Export:       false,
++	}
++	p.UbRegisteredRpcMemoryBudget.Init(base.mgr)
++
++	// UB deadlines. A single search request carries nq rows that are sliced
++	// across QNs and then run maxActiveQueries-at-a-time per QN, so the
++	// per-query wall clock is what bounds the whole batch: with
++	// maxActiveQueries=1 a 125-row slice costs 125 * per-query latency.
++	p.UbQueryTimeoutMs = ParamItem{
++		Key:          "queryNode.ub.queryTimeoutMs",
++		Version:      "3.0.0",
++		DefaultValue: "0",
++		Doc:          "per-query wall-clock deadline in ms for the UB runtime; 0 = built-in default (30s). Bound a whole nq batch: nq_per_qn / concurrency * per-query latency",
++		Export:       false,
++	}
++	p.UbQueryTimeoutMs.Init(base.mgr)
++
++	p.UbOperationTimeoutMs = ParamItem{
++		Key:          "queryNode.ub.operationTimeoutMs",
++		Version:      "3.0.0",
++		DefaultValue: "0",
++		Doc:          "per-phase (attempt) budget in ms for the UB runtime; 0 = built-in default (5s). A stalled phase is re-attempted until the query deadline",
++		Export:       false,
++	}
++	p.UbOperationTimeoutMs.Init(base.mgr)
++
+ 	// UbReadJfsDepth overrides the URMA READ JFS (WR slot pool) depth.
+ 	// 0 = auto: config.cpp resolves to max(1024, max_active_queries * expand_batch * 2).
+ 	// Override when raising max_active_queries beyond ~32 so the slot pool
+diff --git a/internal/querynodev2/ub/ub_slice.go b/internal/querynodev2/ub/ub_slice.go
+new file mode 100644
+index 0000000..82d562e
+--- /dev/null
++++ b/internal/querynodev2/ub/ub_slice.go
+@@ -0,0 +1,342 @@
++// Licensed to the LF AI & Data foundation under one
++// or more contributor license agreements. See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership. The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License. You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Row sharding for the UB delegator fast path.
++//
++// The proxy splits one client search into one SearchRequest per vchannel and
++// sends every one of them the SAME nq query rows. UB search is a global graph
++// walk, so each channel can search a disjoint subset of the rows and the
++// proxy's per-query reduce merges the partial results:
++//
++//	row i belongs to channel rank i % mod
++//
++// With mod == dmlChannelNum that turns "8 QNs each run all nq rows" into
++// "8 QNs each run nq/8 rows", and the per-QN C++ scheduler can then run those
++// rows concurrently on its search workers.
++//
++// Correctness hinges on mod being the number of requests that actually reach
++// a QN for one client search, i.e. the number of vchannels of the collection.
++// That is rootCoord.dmlChannelNum at collection creation. We additionally
++// require it to match the index's shard count (the topology invariant:
++// shards == vchannels == QN ranks), and disable sharding otherwise rather
++// than risk silently dropping rows.
++
++package ub
++
++import (
++	"fmt"
++	"sync/atomic"
++
++	"google.golang.org/protobuf/proto"
++
++	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
++	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
++	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
++	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
++	"github.com/milvus-io/milvus/pkg/v3/util/merr"
++	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
++)
++
++// ubExpectedShardCount is the index shard count reported by global.meta,
++// staged by the querynode init path. 0 means "unknown".
++var ubExpectedShardCount atomic.Int64
++
++// SetExpectedShardCount stages the UB index shard count. Called once during
++// querynode init, after the UB runtime is seeded.
++func SetExpectedShardCount(count int) {
++	if count > 0 {
++		ubExpectedShardCount.Store(int64(count))
++	}
++}
++
++// ExpectedShardCount returns the staged UB index shard count (0 = unknown).
++func ExpectedShardCount() int {
++	return int(ubExpectedShardCount.Load())
++}
++
++// ShardModulus returns how many disjoint row slices one client search is
++// split into, or 0 when row sharding is unavailable/unsafe.
++//
++// The rank of a channel is its dense position among THIS process's channels
++// of the collection, so the modulus is that channel count — not
++// rootCoord.dmlChannelNum. Measured on a real cluster: an 8-shard collection
++// gets 8 vchannels named dml_0,1,10,11,12,13,14,15 while
++// rootCoord.dmlChannelNum stays at its default 16, i.e. the allocator pool is
++// larger than the per-collection channel count and the indices are sparse.
++// Any rule based on the raw index (n < mod, n % mod) or on dmlChannelNum
++// therefore either disables sharding or silently drops rows.
++//
++// The dense rank is a *global* rank only when this process hosts every
++// vchannel of the collection (the SN-embedded / one-QN-per-collection
++// topology). Otherwise we cannot tell which slice is ours, so sharding stays
++// off instead of double-searching or skipping rows.
++func ShardModulus(collectionID int64) int {
++	if !paramtable.Get().QueryNodeCfg.UbRowSharding.GetAsBool() {
++		return 0
++	}
++	count := LocalChannelCount(collectionID)
++	if count < 2 {
++		return 0
++	}
++	// Topology invariant: shard count == vchannel count.
++	if expected := ExpectedShardCount(); expected > 0 && expected != count {
++		return 0
++	}
++	return count
++}
++
++// ChannelRank maps a vchannel to its dense row-slice rank in [0, mod).
++func ChannelRank(collectionID int64, channel string) (rank int, mod int, ok bool) {
++	mod = ShardModulus(collectionID)
++	if mod == 0 {
++		return 0, 0, false
++	}
++	rank, found := localChannelRank(collectionID, channel)
++	if !found {
++		return 0, 0, false
++	}
++	return rank, mod, true
++}
++
++// localChannelRank returns the number of the collection's local channels that
++// sort before channel. That is a stable dense rank for the whole process.
++func localChannelRank(collectionID int64, channel string) (int, bool) {
++	v, ok := ubLocalChannels.Load(collectionID)
++	if !ok {
++		return 0, false
++	}
++	set, ok := v.(*channelSet)
++	if !ok {
++		return 0, false
++	}
++	set.mu.Lock()
++	defer set.mu.Unlock()
++	if _, present := set.channels[channel]; !present {
++		return 0, false
++	}
++	rank := 0
++	for other := range set.channels {
++		if other < channel {
++			rank++
++		}
++	}
++	return rank, true
++}
++
++// RowSlice describes one channel's share of a client search.
++type RowSlice struct {
++	// Request is the forwarded/local request carrying only NqOut rows.
++	Request *querypb.SearchRequest
++	Rank    int
++	Mod     int
++	NqIn    int64
++	NqOut   int64
++	TopK    int64
++	ReqID   int64
++	Metric  string
++}
++
++// SliceForChannel returns the rows this channel owns, or nil when row
++// sharding does not apply (disabled, incomplete local channel set, empty
++// batch...). The returned request is a fresh message: the caller's request is
++// not modified and stays usable for the fallback paths.
++func SliceForChannel(req *querypb.SearchRequest, collectionID int64, channel string) (*RowSlice, error) {
++	if req == nil || req.GetReq() == nil {
++		return nil, nil
++	}
++	rank, mod, ok := ChannelRank(collectionID, channel)
++	if !ok {
++		return nil, nil
++	}
++	values, placeholder, err := placeholderRows(req.GetReq().GetPlaceholderGroup())
++	if err != nil {
++		return nil, err
++	}
++	if len(values) == 0 {
++		return nil, nil
++	}
++
++	picked := make([][]byte, 0, (len(values)+mod-1)/mod)
++	for i := rank; i < len(values); i += mod {
++		picked = append(picked, values[i])
++	}
++
++	// Reuse the original placeholder value (tag/type/unknown fields), only
++	// swapping the row payload. proto.Clone of the placeholder value is
++	// cheap: it shares the row byte slices.
++	value := proto.Clone(placeholder).(*commonpb.PlaceholderValue)
++	value.Values = picked
++	group := &commonpb.PlaceholderGroup{
++		Placeholders: []*commonpb.PlaceholderValue{value},
++	}
++	raw, err := proto.Marshal(group)
++	if err != nil {
++		return nil, fmt.Errorf("ub: marshal sliced placeholder: %w", err)
++	}
++
++	inner := cloneSearchRequestWithoutPlaceholder(req.GetReq())
++	inner.PlaceholderGroup = raw
++	inner.Nq = int64(len(picked))
++
++	topk := req.GetReq().GetTopk()
++	if topk <= 0 {
++		if planTopk, _, perr := parsePlan(req.GetReq()); perr == nil {
++			topk = planTopk
++		}
++	}
++	if topk <= 0 {
++		// ScatterResult needs the row stride; without it, keep the legacy
++		// path rather than emit a result the proxy cannot lay out.
++		return nil, nil
++	}
++
++	return &RowSlice{
++		Request: &querypb.SearchRequest{
++			Req:             inner,
++			DmlChannels:     req.GetDmlChannels(),
++			Scope:           req.GetScope(),
++			TotalChannelNum: req.GetTotalChannelNum(),
++		},
++		Rank:   rank,
++		Mod:    mod,
++		NqIn:   int64(len(values)),
++		NqOut:  int64(len(picked)),
++		TopK:   topk,
++		ReqID:  req.GetReq().GetReqID(),
++		Metric: req.GetReq().GetMetricType(),
++	}, nil
++}
++
++// placeholderRows returns the per-row byte slices of a placeholder group.
++// Each Values[i] is one query row (dim*4 bytes), so slicing rows never needs
++// to decode floats.
++func placeholderRows(raw []byte) ([][]byte, *commonpb.PlaceholderValue, error) {
++	if len(raw) == 0 {
++		return nil, nil, fmt.Errorf("ub: empty placeholder group")
++	}
++	group := &commonpb.PlaceholderGroup{}
++	if err := proto.Unmarshal(raw, group); err != nil {
++		return nil, nil, fmt.Errorf("ub: unmarshal placeholder group: %w", err)
++	}
++	if len(group.GetPlaceholders()) != 1 {
++		return nil, nil, fmt.Errorf("ub: placeholder group has %d placeholders, want 1", len(group.GetPlaceholders()))
++	}
++	placeholder := group.GetPlaceholders()[0]
++	return placeholder.GetValues(), placeholder, nil
++}
++
++// cloneSearchRequestWithoutPlaceholder clones the request metadata while
++// avoiding a copy of the (multi-megabyte) placeholder. The source request is
++// owned by the current RPC; the temporary field swap is restored before
++// returning.
++func cloneSearchRequestWithoutPlaceholder(src *internalpb.SearchRequest) *internalpb.SearchRequest {
++	saved := src.PlaceholderGroup
++	src.PlaceholderGroup = nil
++	clone, _ := proto.Clone(src).(*internalpb.SearchRequest)
++	src.PlaceholderGroup = saved
++	if clone == nil {
++		return &internalpb.SearchRequest{}
++	}
++	return clone
++}
++
++// ScatterResult maps a slice result back into the full nq row space: rows
++// owned by this rank carry their topk, every other row reports 0 rows, and
++// Ids/Scores stay densely packed in query order. That is exactly the shape
++// the proxy reduce consumes for a shard that returned nothing for a query
++// (offsets come from Topks, see reduceSearchResultDataNoGroupBy).
++func ScatterResult(sliced *internalpb.SearchResults, s *RowSlice) *internalpb.SearchResults {
++	if s == nil {
++		return sliced
++	}
++	if sliced == nil || sliced.GetResultData() == nil {
++		return emptySearchResult(s.NqIn, s.TopK, s.ReqID, s.Metric)
++	}
++
++	src := sliced.GetResultData()
++	srcTopks := src.GetTopks()
++	ids := src.GetIds().GetIntId().GetData()
++	scores := src.GetScores()
++
++	topks := make([]int64, s.NqIn)
++	outIDs := make([]int64, 0, len(ids))
++	outScores := make([]float32, 0, len(scores))
++	for i := int64(0); i < s.NqIn; i++ {
++		if int(i)%s.Mod != s.Rank {
++			continue
++		}
++		j := int(i) / s.Mod
++		if j >= len(srcTopks) {
++			break
++		}
++		k := int(srcTopks[j])
++		if k <= 0 {
++			continue
++		}
++		if k > int(s.TopK) {
++			k = int(s.TopK)
++		}
++		// The producer (RunSearchAsWorker) packs the slice rows at a fixed
++		// stride of TopK, so row j starts at j*TopK and may use fewer than
++		// TopK entries.
++		base := j * int(s.TopK)
++		if base+k > len(ids) || base+k > len(scores) {
++			break
++		}
++		outIDs = append(outIDs, ids[base:base+k]...)
++		outScores = append(outScores, scores[base:base+k]...)
++		topks[i] = int64(k)
++	}
++
++	return &internalpb.SearchResults{
++		Status:     sliced.GetStatus(),
++		ReqID:      s.ReqID,
++		MetricType: s.Metric,
++		NumQueries: s.NqIn,
++		TopK:       s.TopK,
++		ResultData: &schemapb.SearchResultData{
++			NumQueries: s.NqIn,
++			TopK:       s.TopK,
++			Ids: &schemapb.IDs{
++				IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: outIDs}},
++			},
++			Scores:     outScores,
++			Topks:      topks,
++			FieldsData: []*schemapb.FieldData{},
++		},
++	}
++}
++
++// emptySearchResult builds the "no rows contributed" reply for nq rows.
++func emptySearchResult(nq, topk int64, reqID int64, metricType string) *internalpb.SearchResults {
++	return &internalpb.SearchResults{
++		Status:     merr.Success(),
++		ReqID:      reqID,
++		MetricType: metricType,
++		NumQueries: nq,
++		TopK:       topk,
++		ResultData: &schemapb.SearchResultData{
++			NumQueries: nq,
++			TopK:       topk,
++			Ids: &schemapb.IDs{
++				IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{}},
++			},
++			Scores:     []float32{},
++			Topks:      make([]int64, nq),
++			FieldsData: []*schemapb.FieldData{},
++		},
++	}
++}
+diff --git a/internal/querynodev2/ub/ub_slice_test.go b/internal/querynodev2/ub/ub_slice_test.go
+new file mode 100644
+index 0000000..46ef196
+--- /dev/null
++++ b/internal/querynodev2/ub/ub_slice_test.go
+@@ -0,0 +1,246 @@
++// Licensed to the LF AI & Data foundation under one
++// or more contributor license agreements. See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership. The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License. You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package ub
++
++import (
++	"bytes"
++	"fmt"
++	"math"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/proto"
++
++	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
++	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
++	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
++	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
++	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
++)
++
++func rowShardingEnabled() bool {
++	return paramtable.Get().QueryNodeCfg.UbRowSharding.GetAsBool()
++}
++
++// sparseTestChannels mirrors what a real cluster allocates for an 8-shard
++// collection with rootCoord.dmlChannelNum=16: 8 channels with sparse indices.
++var sparseTestChannels = []string{
++	"by-dev-rootcoord-dml_0_9000001v0",
++	"by-dev-rootcoord-dml_1_9000001v0",
++	"by-dev-rootcoord-dml_10_9000001v1",
++	"by-dev-rootcoord-dml_11_9000001v1",
++	"by-dev-rootcoord-dml_12_9000001v2",
++	"by-dev-rootcoord-dml_13_9000001v2",
++	"by-dev-rootcoord-dml_14_9000001v3",
++	"by-dev-rootcoord-dml_15_9000001v3",
++}
++
++func registerTestCollection(t *testing.T, collectionID int64, channels []string) {
++	t.Helper()
++	for _, channel := range channels {
++		RegisterLocalChannel(collectionID, channel)
++	}
++	t.Cleanup(func() {
++		for _, channel := range channels {
++			UnregisterLocalChannel(collectionID, channel)
++		}
++	})
++}
++
++// TestChannelRankUsesLocalChannelSet pins the fix for the real-cluster
++// mismatch: an 8-shard collection gets 8 vchannels with SPARSE indices
++// (dml_0,1,10..15) while dmlChannelNum stays 16. Rank must be the dense
++// position in the local channel set and the modulus must be the channel count,
++// never the dml channel index nor dmlChannelNum.
++func TestChannelRankUsesLocalChannelSet(t *testing.T) {
++	if !rowShardingEnabled() {
++		t.Skip("row sharding disabled in this configuration")
++	}
++	const collectionID = int64(9000001)
++	SetExpectedShardCount(len(sparseTestChannels))
++	registerTestCollection(t, collectionID, sparseTestChannels)
++
++	assert.Equal(t, len(sparseTestChannels), ShardModulus(collectionID))
++
++	seen := make(map[int]string, len(sparseTestChannels))
++	for _, channel := range sparseTestChannels {
++		rank, mod, ok := ChannelRank(collectionID, channel)
++		require.True(t, ok, "channel %s must map to a rank", channel)
++		assert.Equal(t, len(sparseTestChannels), mod)
++		assert.GreaterOrEqual(t, rank, 0)
++		assert.Less(t, rank, mod)
++		other, duplicate := seen[rank]
++		assert.False(t, duplicate, "rank %d used by both %s and %s", rank, other, channel)
++		seen[rank] = channel
++	}
++	// Every rank in [0, mod) is owned by exactly one channel: the slices
++	// together cover every query row exactly once.
++	assert.Len(t, seen, len(sparseTestChannels))
++
++	// Unknown channel / incomplete set disables sharding instead of guessing.
++	_, _, ok := ChannelRank(collectionID, "by-dev-rootcoord-dml_2_9000001v0")
++	assert.False(t, ok)
++
++	UnregisterLocalChannel(collectionID, sparseTestChannels[0])
++	_, _, ok = ChannelRank(collectionID, sparseTestChannels[1])
++	assert.False(t, ok, "a partial channel set must disable sharding")
++}
++
++// TestChannelRankSingleChannelProcess verifies the fallback: a process that
++// hosts one channel cannot know its global rank, so sharding stays off.
++func TestChannelRankSingleChannelProcess(t *testing.T) {
++	if !rowShardingEnabled() {
++		t.Skip("row sharding disabled in this configuration")
++	}
++	const collectionID = int64(9000002)
++	SetExpectedShardCount(8)
++	RegisterLocalChannel(collectionID, "by-dev-rootcoord-dml_3_9000002v0")
++	t.Cleanup(func() { UnregisterLocalChannel(collectionID, "by-dev-rootcoord-dml_3_9000002v0") })
++
++	rank, mod, ok := ChannelRank(collectionID, "by-dev-rootcoord-dml_3_9000002v0")
++	assert.False(t, ok)
++	assert.Equal(t, 0, rank)
++	assert.Equal(t, 0, mod)
++}
++
++// TestSliceForChannel verifies the strided split: channel rank r owns rows
++// i%mod==r, the sliced request carries exactly those rows, the original
++// request is left untouched, and no float decode is involved.
++func TestSliceForChannel(t *testing.T) {
++	if !rowShardingEnabled() {
++		t.Skip("row sharding disabled in this configuration")
++	}
++	const collectionID = int64(9000001)
++	SetExpectedShardCount(len(sparseTestChannels))
++	registerTestCollection(t, collectionID, sparseTestChannels)
++
++	const nq, dim, topk = 10, 4, 3
++	channel := sparseTestChannels[2] // dml_10: sparse index, dense rank 1 or 2
++	rank, mod, ok := ChannelRank(collectionID, channel)
++	require.True(t, ok)
++
++	inner := makeSearchRequest(t, topk, 200, nq, dim, "L2")
++	before := append([]byte(nil), inner.PlaceholderGroup...)
++	req := &querypb.SearchRequest{Req: inner, DmlChannels: []string{channel}}
++
++	sliced, err := SliceForChannel(req, collectionID, channel)
++	require.NoError(t, err)
++	require.NotNil(t, sliced)
++
++	wantRows := 0
++	for i := 0; i < nq; i++ {
++		if i%mod == rank {
++			wantRows++
++		}
++	}
++	assert.Equal(t, rank, sliced.Rank)
++	assert.Equal(t, mod, sliced.Mod)
++	assert.Equal(t, int64(nq), sliced.NqIn)
++	assert.Equal(t, int64(wantRows), sliced.NqOut)
++	assert.Equal(t, int64(topk), sliced.TopK)
++	assert.Equal(t, int64(12345), sliced.ReqID)
++	assert.Equal(t, "L2", sliced.Metric)
++	assert.Equal(t, int64(wantRows), sliced.Request.GetReq().GetNq())
++
++	// The sliced placeholder must contain exactly the owned rows, in order.
++	group := &commonpb.PlaceholderGroup{}
++	require.NoError(t, proto.Unmarshal(sliced.Request.GetReq().GetPlaceholderGroup(), group))
++	require.Len(t, group.GetPlaceholders(), 1)
++	values := group.GetPlaceholders()[0].GetValues()
++	require.Len(t, values, wantRows)
++	at := 0
++	for i := 0; i < nq; i++ {
++		if i%mod != rank {
++			continue
++		}
++		// makeSearchRequest encodes row i as floats i*dim+j.
++		want := make([]byte, dim*4)
++		for j := 0; j < dim; j++ {
++			bits := math.Float32bits(float32(i*dim + j))
++			want[j*4+0] = byte(bits)
++			want[j*4+1] = byte(bits >> 8)
++			want[j*4+2] = byte(bits >> 16)
++			want[j*4+3] = byte(bits >> 24)
++		}
++		assert.True(t, bytes.Equal(want, values[at]), "row %d not at slice position %d", i, at)
++		at++
++	}
++
++	// The source request stays reusable for the fallback paths.
++	assert.True(t, bytes.Equal(before, inner.PlaceholderGroup))
++	assert.Equal(t, int64(nq), inner.GetNq())
++
++	// A channel outside the local set disables sharding instead of guessing.
++	none, err := SliceForChannel(req, collectionID, fmt.Sprintf(
++		"by-dev-rootcoord-dml_2_%dv0", collectionID))
++	require.NoError(t, err)
++	assert.Nil(t, none)
++}
++
++// TestScatterResult verifies the inverse mapping: a slice result is expanded
++// into the full nq row space with 0-topk rows for queries owned by other
++// ranks and densely packed ids/scores.
++func TestScatterResult(t *testing.T) {
++	const (
++		nq   = 10
++		mod  = 4
++		rank = 1
++		topk = 3
++	)
++	// Rows owned by rank 1: i = 1, 5, 9 -> 3 slice rows with 3/2/3 hits.
++	// The producer packs slice rows at a fixed stride of topk, so row 1 ends
++	// at index 3 (its last entry is padding and must be dropped).
++	sliceTopks := []int64{3, 2, 3}
++	ids := []int64{101, 102, 103, 201, 202, 0, 301, 302, 303}
++	scores := []float32{1, 2, 3, 4, 5, 0, 6, 7, 8}
++	sliced := &internalpb.SearchResults{
++		ResultData: &schemapb.SearchResultData{
++			NumQueries: 3,
++			TopK:       topk,
++			Ids:        &schemapb.IDs{IdField: &schemapb.IDs_IntId{IntId: &schemapb.LongArray{Data: ids}}},
++			Scores:     scores,
++			Topks:      sliceTopks,
++		},
++	}
++	s := &RowSlice{Rank: rank, Mod: mod, NqIn: nq, NqOut: 3, TopK: topk, ReqID: 7, Metric: "L2"}
++
++	out := ScatterResult(sliced, s)
++	require.NotNil(t, out)
++	assert.Equal(t, int64(nq), out.GetNumQueries())
++	assert.Equal(t, int64(topk), out.GetTopK())
++	require.Len(t, out.GetResultData().GetTopks(), nq)
++
++	want := map[int]int64{1: 3, 5: 2, 9: 3}
++	for i := 0; i < nq; i++ {
++		assert.Equal(t, want[i], out.GetResultData().GetTopks()[i], "topks[%d]", i)
++	}
++	assert.Equal(t, []int64{101, 102, 103, 201, 202, 301, 302, 303},
++		out.GetResultData().GetIds().GetIntId().GetData())
++	assert.Equal(t, []float32{1, 2, 3, 4, 5, 6, 7, 8}, out.GetResultData().GetScores())
++
++	// A missing slice result still answers (0 rows) so the proxy merge is not
++	// short a channel.
++	empty := ScatterResult(nil, s)
++	require.NotNil(t, empty)
++	assert.Equal(t, int64(nq), empty.GetNumQueries())
++	require.Len(t, empty.GetResultData().GetTopks(), nq)
++	for _, v := range empty.GetResultData().GetTopks() {
++		assert.Equal(t, int64(0), v)
++	}
++	assert.Empty(t, empty.GetResultData().GetIds().GetIntId().GetData())
++}
+diff --git a/internal/querynodev2/ub/ub_forward_test.go b/internal/querynodev2/ub/ub_forward_test.go
+new file mode 100644
+index 0000000..f0ce021
+--- /dev/null
++++ b/internal/querynodev2/ub/ub_forward_test.go
+@@ -0,0 +1,109 @@
++// Licensed to the LF AI & Data foundation under one
++// or more contributor license agreements. See the NOTICE file
++// distributed with this work for additional information
++// regarding copyright ownership. The ASF licenses this file
++// to you under the Apache License, Version 2.0 (the
++// "License"); you may not use this file except in compliance
++// with the License. You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package ub
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
++	"github.com/milvus-io/milvus/pkg/v3/util/merr"
++)
++
++// TestForwardElection verifies that a multi-channel process elects exactly
++// one forwarding channel per collection, so one client search issues one P2P
++// forward instead of one per vchannel.
++func TestForwardElection(t *testing.T) {
++	const collection = int64(1001)
++
++	// Untracked collection: legacy behaviour (forward).
++	assert.True(t, IsElectedForwardChannel(collection, "chan-a"))
++	assert.Equal(t, 0, LocalChannelCount(collection))
++
++	channels := []string{
++		"by-dev-rootcoord-dml_2_xv2",
++		"by-dev-rootcoord-dml_0_xv0",
++		"by-dev-rootcoord-dml_1_xv1",
++	}
++	for _, channel := range channels {
++		RegisterLocalChannel(collection, channel)
++	}
++	require.Equal(t, len(channels), LocalChannelCount(collection))
++
++	elected := 0
++	for _, channel := range channels {
++		if IsElectedForwardChannel(collection, channel) {
++			elected++
++			assert.Equal(t, "by-dev-rootcoord-dml_0_xv0", channel)
++		}
++	}
++	assert.Equal(t, 1, elected)
++
++	// Another collection in the same process elects independently.
++	const otherCollection = int64(2002)
++	RegisterLocalChannel(otherCollection, "by-dev-rootcoord-dml_7_yv0")
++	RegisterLocalChannel(otherCollection, "by-dev-rootcoord-dml_3_yv0")
++	assert.True(t, IsElectedForwardChannel(otherCollection, "by-dev-rootcoord-dml_3_yv0"))
++	assert.False(t, IsElectedForwardChannel(otherCollection, "by-dev-rootcoord-dml_7_yv0"))
++	// The first collection is unaffected.
++	assert.True(t, IsElectedForwardChannel(collection, "by-dev-rootcoord-dml_0_xv0"))
++
++	// Releasing the elected channel moves the election to the next one.
++	UnregisterLocalChannel(collection, "by-dev-rootcoord-dml_0_xv0")
++	assert.True(t, IsElectedForwardChannel(collection, "by-dev-rootcoord-dml_1_xv1"))
++	assert.False(t, IsElectedForwardChannel(collection, "by-dev-rootcoord-dml_2_xv2"))
++
++	for _, channel := range channels[1:] {
++		UnregisterLocalChannel(collection, channel)
++	}
++	UnregisterLocalChannel(otherCollection, "by-dev-rootcoord-dml_7_yv0")
++	UnregisterLocalChannel(otherCollection, "by-dev-rootcoord-dml_3_yv0")
++
++	// Fully released: registry entry is gone and the legacy default returns.
++	assert.Equal(t, 0, LocalChannelCount(collection))
++	assert.True(t, IsElectedForwardChannel(collection, "chan-a"))
++}
++
++// TestEmptySearchResultsShape pins the "channel contributed no rows" wire
++// shape: request nq/topk, zero topks and empty ids/scores, which is what the
++// proxy reduce accepts for a channel with no matches.
++func TestEmptySearchResultsShape(t *testing.T) {
++	req := &internalpb.SearchRequest{
++		ReqID:        7,
++		Nq:           2,
++		Topk:         3,
++		MetricType:   "L2",
++		CollectionID: 42,
++	}
++	res := EmptySearchResults(req)
++
++	require.NotNil(t, res)
++	assert.True(t, merr.Ok(res.GetStatus()))
++	assert.Equal(t, int64(2), res.GetNumQueries())
++	assert.Equal(t, int64(3), res.GetTopK())
++	require.NotNil(t, res.GetResultData())
++	assert.Equal(t, int64(2), res.GetResultData().GetNumQueries())
++	assert.Equal(t, int64(3), res.GetResultData().GetTopK())
++	require.Len(t, res.GetResultData().GetTopks(), 2)
++	for _, topk := range res.GetResultData().GetTopks() {
++		assert.Equal(t, int64(0), topk)
++	}
++	assert.Empty(t, res.GetResultData().GetIds().GetIntId().GetData())
++	assert.Empty(t, res.GetResultData().GetScores())
++}
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/debug_trace.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/debug_trace.hpp
+new file mode 100644
+index 0000000..3db5172
+--- /dev/null
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/debug_trace.hpp
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <cstdio>
++#include <cstdlib>
++
++namespace hnsw_urma {
++
++// Per-operation tracing (distance scheduling, progress drains, per-row entry
++// logs). Off unless UB_TRACE is set to something other than "" / "0".
++//
++// These prints sit on the critical path of every distance phase and every
++// completion. Under concurrent queries the stderr writes serialize across all
++// runtime threads and, when stderr is a pipe consumed by a slow log shipper,
++// can block them entirely — which looks exactly like a scheduler deadlock.
++// Error paths keep using fprintf directly so failures are never hidden.
++inline bool TraceEnabled() noexcept {
++  static const bool enabled = []() noexcept {
++    const char* value = std::getenv("UB_TRACE");
++    return value != nullptr && value[0] != '\0' && value[0] != '0';
++  }();
++  return enabled;
++}
++
++}  // namespace hnsw_urma
++
++#define UB_TRACE_LOG(...)                     \
++  do {                                        \
++    if (::hnsw_urma::TraceEnabled()) {        \
++      std::fprintf(stderr, __VA_ARGS__);      \
++    }                                         \
++  } while (false)
