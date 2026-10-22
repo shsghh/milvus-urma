@@ -41,7 +41,7 @@ index 613b138..2807127 100644
  	// force_main=true path always sets is_main=true on success.
  	out.IsMain = true
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
-index 2abcde0..a38003c 100644
+index 2abcde0..951c458 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime.hpp
 @@ -259,6 +259,20 @@ class MilvusUbRuntime {
@@ -65,6 +65,19 @@ index 2abcde0..a38003c 100644
    };
  
    // Returns a snapshot of the staged knobs (thread-safe). Values are those
+@@ -278,6 +292,12 @@ class MilvusUbRuntime {
+   // under state_mutex_ once all shards are present. Idempotent.
+   Status EnsureReadersBuilt(Metric metric);
+ 
++  // Maps the Go-staged knobs onto a RuntimeConfig. Shared by
++  // EnsureRpcMailbox (which publishes the mailbox before the distributed
++  // runtime exists) and EnableDistributedSearchLocked, so both size the RPC
++  // mailbox/mailbox plan identically. Caller holds state_mutex_.
++  RuntimeConfig RequestedRuntimeConfig() const;
++
+   // Reset everything to empty. Caller holds state_mutex_.
+   void ResetLocked();
+ 
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
 index f047e1b..be27b85 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
@@ -148,7 +161,7 @@ index 36e08c1..fb5906c 100644
  //
  // UbLoadShard moves ownership of an already-loaded hnsw_urma::LoadedIndex
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
-index 0246f83..eba1bf0 100644
+index 0246f83..8263038 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
 @@ -50,6 +50,7 @@
@@ -159,90 +172,161 @@ index 0246f83..eba1bf0 100644
  #include "hnsw_urma/index/format.hpp"
  #include "hnsw_urma/runtime/config.hpp"
  #include "hnsw_urma/runtime/counting_notification.hpp"
-@@ -191,6 +192,34 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
-       requested.rpc_progress_threads.automatic = false;
-     }
-     requested.urma_device = k.urma_device;
-+    // Cpu binding / progress mode were staged by Go but never mapped into
-+    // the requested config, so the live runtime always used the built-in
-+    // defaults (auto bind, busy progress). Map them now.
-+    //
-+    // cpu_layout is only mapped for the explicit LLC strategies: "contiguous"
-+    // (the Go default) keeps CpuLayout::kAuto, which is what every previous
-+    // build effectively ran (kAuto discovers the topology and falls back to
-+    // contiguous), so mapping it here would silently move threads between
-+    // LLCs and invalidate prior measurements.
-+    if (!k.cpu_bind_mode.empty()) {
-+      requested.cpu_bind =
-+          k.cpu_bind_mode == "none" ? CpuBindMode::kNone : CpuBindMode::kAuto;
-+    }
-+    if (k.cpu_layout == "llc-isolated") {
-+      requested.cpu_layout = CpuLayout::kLlcIsolated;
-+    } else if (k.cpu_layout == "llc-spread") {
-+      requested.cpu_layout = CpuLayout::kLlcSpread;
-+    }
-+    // progress_mode is one knob for three roles whose built-in defaults are
-+    // NOT the same (read/rpc = busy, distance service = adaptive). Only map
-+    // the explicit "adaptive" opt-in: mapping "busy" would flip the distance
-+    // service from its adaptive default to a busy-spin and change CPU usage
-+    // for every existing deployment.
-+    if (k.progress_mode == "adaptive") {
-+      requested.read_progress_mode = ProgressMode::kAdaptive;
-+      requested.rpc_progress_mode = ProgressMode::kAdaptive;
-+      requested.distance_progress_mode = ProgressMode::kAdaptive;
-+    }
-     // Override the default (16) with the staged knob. 0 means "not set
-     // by Go" → keep the config.hpp default already in requested.
-     if (k.max_active_queries) {
-@@ -200,6 +229,47 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
-       requested.read_jfs_depth.value = k.read_jfs_depth;
-       requested.read_jfs_depth.automatic = false;
-     }
-+    // Startup memory ceilings for the queue / registered-RPC plans. 0 keeps
-+    // the config.hpp defaults.
-+    if (k.queue_memory_budget_bytes != 0) {
-+      requested.queue_memory_budget_bytes = k.queue_memory_budget_bytes;
-+    }
-+    if (k.registered_rpc_memory_budget_bytes != 0) {
-+      requested.registered_rpc_memory_budget_bytes =
-+          k.registered_rpc_memory_budget_bytes;
-+    }
-+    // Deadlines. Keep query >= operation: SearchParams rejects the opposite,
-+    // and the scheduler deadline is what bounds a whole nq batch.
-+    if (k.operation_timeout_ms != 0) {
-+      requested.operation_timeout_ms = k.operation_timeout_ms;
-+    }
-+    if (k.query_timeout_ms != 0) {
-+      requested.query_timeout_ms = k.query_timeout_ms;
-+    }
-+    if (requested.query_timeout_ms < requested.operation_timeout_ms) {
-+      LOG_WARN("UB timeouts: query_timeout_ms={} < operation_timeout_ms={}; "
-+               "raising query_timeout_ms to the operation budget",
-+               requested.query_timeout_ms, requested.operation_timeout_ms);
-+      requested.query_timeout_ms = requested.operation_timeout_ms;
-+    }
+@@ -111,6 +112,111 @@ static void UbDumpUrmaState(const char* label,
+                             urma_jfs_t* read_jfs,
+                             urma_jfc_t* read_jfc);
+ 
++// Maps the Go-staged knobs (UbSetConfig / UbSetMemoryBudget / UbSetTimeouts)
++// onto a RuntimeConfig. Both EnableDistributedSearchLocked and
++// EnsureRpcMailbox call this: the mailbox is created and published to the URMA
++// directory before the distributed runtime exists, and it must be sized from
++// exactly the plan the transport will later use.
++//
++// Caller holds state_mutex_ (knobs_ is guarded by it).
++RuntimeConfig MilvusUbRuntime::RequestedRuntimeConfig() const {
++  RuntimeConfig requested;
++  const Knobs& k = knobs_;
++  if (k.search_workers) {
++    requested.search_workers.value = k.search_workers;
++    requested.search_workers.automatic = false;
 +  }
-+
++  if (k.distance_workers) {
++    requested.distance_workers.value = k.distance_workers;
++    requested.distance_workers.automatic = false;
++  }
++  if (k.read_progress_workers) {
++    requested.read_progress_threads.value = k.read_progress_workers;
++    requested.read_progress_threads.automatic = false;
++  }
++  if (k.rpc_progress_workers) {
++    requested.rpc_progress_threads.value = k.rpc_progress_workers;
++    requested.rpc_progress_threads.automatic = false;
++  }
++  requested.urma_device = k.urma_device;
++  // Cpu binding / progress mode were staged by Go but never mapped into the
++  // requested config, so the live runtime always used the built-in defaults
++  // (auto bind, busy progress). Map them now.
++  //
++  // cpu_layout is only mapped for the explicit LLC strategies: "contiguous"
++  // (the Go default) keeps CpuLayout::kAuto, which is what every previous
++  // build effectively ran (kAuto discovers the topology and falls back to
++  // contiguous), so mapping it here would silently move threads between LLCs
++  // and invalidate prior measurements.
++  if (!k.cpu_bind_mode.empty()) {
++    requested.cpu_bind =
++        k.cpu_bind_mode == "none" ? CpuBindMode::kNone : CpuBindMode::kAuto;
++  }
++  if (k.cpu_layout == "llc-isolated") {
++    requested.cpu_layout = CpuLayout::kLlcIsolated;
++  } else if (k.cpu_layout == "llc-spread") {
++    requested.cpu_layout = CpuLayout::kLlcSpread;
++  }
++  // progress_mode is one knob for three roles whose built-in defaults are NOT
++  // the same (read/rpc = busy, distance service = adaptive). Only map the
++  // explicit "adaptive" opt-in: mapping "busy" would flip the distance service
++  // from its adaptive default to a busy-spin and change CPU usage for every
++  // existing deployment.
++  if (k.progress_mode == "adaptive") {
++    requested.read_progress_mode = ProgressMode::kAdaptive;
++    requested.rpc_progress_mode = ProgressMode::kAdaptive;
++    requested.distance_progress_mode = ProgressMode::kAdaptive;
++  }
++  // Override the default (16) with the staged knob. 0 means "not set by Go" →
++  // keep the config.hpp default already in requested.
++  if (k.max_active_queries) {
++    requested.max_active_queries = k.max_active_queries;
++  }
++  if (k.read_jfs_depth) {
++    requested.read_jfs_depth.value = k.read_jfs_depth;
++    requested.read_jfs_depth.automatic = false;
++  }
++  // Startup memory ceilings for the queue / registered-RPC plans. 0 keeps the
++  // config.hpp defaults.
++  if (k.queue_memory_budget_bytes != 0) {
++    requested.queue_memory_budget_bytes = k.queue_memory_budget_bytes;
++  }
++  if (k.registered_rpc_memory_budget_bytes != 0) {
++    requested.registered_rpc_memory_budget_bytes =
++        k.registered_rpc_memory_budget_bytes;
++  }
++  // Deadlines. Keep query >= operation: SearchParams rejects the opposite, and
++  // the scheduler deadline is what bounds a whole nq batch.
++  if (k.operation_timeout_ms != 0) {
++    requested.operation_timeout_ms = k.operation_timeout_ms;
++  }
++  if (k.query_timeout_ms != 0) {
++    requested.query_timeout_ms = k.query_timeout_ms;
++  }
++  if (requested.query_timeout_ms < requested.operation_timeout_ms) {
++    LOG_WARN("UB timeouts: query_timeout_ms={} < operation_timeout_ms={}; "
++             "raising query_timeout_ms to the operation budget",
++             requested.query_timeout_ms, requested.operation_timeout_ms);
++    requested.query_timeout_ms = requested.operation_timeout_ms;
++  }
 +  // The distributed search path builds SearchParams from its own defaults
 +  // (query_context.hpp), and RuntimeConfig::expand_batch only sizes the
 +  // startup plans. If the config is smaller than the batch the search path
 +  // actually uses, maximum_batch is undersized and PrepareForWait rejects
-+  // batches at run time (kOutOfRange). Size for the larger of the two and
-+  // say so, instead of failing later per query.
-+  {
-+    const std::uint32_t search_expand_batch = SearchParams{}.expand_batch;
-+    if (search_expand_batch > requested.expand_batch) {
-+      LOG_WARN(
-+          "UB expand_batch: config={} is below the search default={}; "
-+          "sizing startup plans (JFS depth, queue/RPC budgets, "
-+          "maximum_batch=M0*{}) for the search default",
-+          requested.expand_batch, search_expand_batch, search_expand_batch);
-+      requested.expand_batch = search_expand_batch;
-+    }
++  // batches at run time (kOutOfRange). Size for the larger of the two and say
++  // so, instead of failing later per query.
++  const std::uint32_t search_expand_batch = SearchParams{}.expand_batch;
++  if (search_expand_batch > requested.expand_batch) {
++    LOG_WARN(
++        "UB expand_batch: config={} is below the search default={}; sizing "
++        "startup plans (JFS depth, queue/RPC budgets, maximum_batch=M0*{}) "
++        "for the search default",
++        requested.expand_batch, search_expand_batch, search_expand_batch);
++    requested.expand_batch = search_expand_batch;
++  }
++  return requested;
++}
++
+ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+   if (distributed_runtime_) {
+     // If the previous enable happened when peers were not yet published
+@@ -170,37 +276,10 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+     local_rank = std::min(local_rank, static_cast<std::uint32_t>(sid));
    }
  
+-  // Build the requested config from staged knobs (UbSetConfig).
+-  RuntimeConfig requested;
+-  {
+-    const Knobs& k = knobs_;
+-    if (k.search_workers) {
+-      requested.search_workers.value = k.search_workers;
+-      requested.search_workers.automatic = false;
+-    }
+-    if (k.distance_workers) {
+-      requested.distance_workers.value = k.distance_workers;
+-      requested.distance_workers.automatic = false;
+-    }
+-    if (k.read_progress_workers) {
+-      requested.read_progress_threads.value = k.read_progress_workers;
+-      requested.read_progress_threads.automatic = false;
+-    }
+-    if (k.rpc_progress_workers) {
+-      requested.rpc_progress_threads.value = k.rpc_progress_workers;
+-      requested.rpc_progress_threads.automatic = false;
+-    }
+-    requested.urma_device = k.urma_device;
+-    // Override the default (16) with the staged knob. 0 means "not set
+-    // by Go" → keep the config.hpp default already in requested.
+-    if (k.max_active_queries) {
+-      requested.max_active_queries = k.max_active_queries;
+-    }
+-    if (k.read_jfs_depth) {
+-      requested.read_jfs_depth.value = k.read_jfs_depth;
+-      requested.read_jfs_depth.automatic = false;
+-    }
+-  }
++  // Build the requested config from staged knobs (UbSetConfig). Shared with
++  // EnsureRpcMailbox so the mailbox published at startup is sized from the
++  // same plan the transport later uses.
++  RuntimeConfig requested = RequestedRuntimeConfig();
+ 
    std::vector<std::uint32_t> allowed_cpus = knobs_.allowed_cpus;
-@@ -239,6 +309,8 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+   if (allowed_cpus.empty()) {
+@@ -239,6 +318,8 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
    state->effective = std::move(effective).value();
    const auto* cfg = &*state->effective;
    state->max_active_queries = requested.max_active_queries;
@@ -251,7 +335,73 @@ index 0246f83..eba1bf0 100644
    state->metric = readers_metric_;
    state->eff_search_workers = cfg->search_workers;
    state->eff_read_progress_threads = cfg->read_progress_threads;
-@@ -1630,6 +1702,10 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -377,8 +458,31 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       disable_env != nullptr &&
+       disable_env[0] != '\0' &&
+       disable_env[0] != '0';
+-  const bool rpc_ready =
++  bool rpc_ready =
+       data_plane_ready && missing_rpc_shards.empty() && !rpc_disabled;
++  // The mailbox was created and published by EnsureRpcMailbox before this
++  // runtime existed. Its per-cell capacities must be able to hold one
++  // maximum-size distance batch, otherwise every request is rejected with
++  // "request fragment batch output is too small" (one task already carries a
++  // dim*4 query vector: 3840 B at dim=960, plus ids and the fragment table).
++  // EnsureRpcMailbox now derives the mailbox from the same resolved plan, so a
++  // mismatch means a stale published mailbox: disable pushdown instead of
++  // failing every RPC (pull still serves the query).
++  if (rpc_ready && rpc_memory_ != nullptr &&
++      (rpc_memory_->config().request_capacity <
++           cfg->rpc_request_batch_max_bytes ||
++       rpc_memory_->config().response_capacity <
++           cfg->rpc_response_batch_max_bytes)) {
++    LOG_ERROR(
++        "UB pushdown disabled: published RPC mailbox request/response "
++        "capacity {}/{} < plan {}/{}; restart so EnsureRpcMailbox is built "
++        "from the current plan",
++        rpc_memory_->config().request_capacity,
++        rpc_memory_->config().response_capacity,
++        cfg->rpc_request_batch_max_bytes,
++        cfg->rpc_response_batch_max_bytes);
++    rpc_ready = false;
++  }
+   LOG_INFO("UB EnableDistributed: world_size={} local_rank={} local_shards={} peer_handles={} peer_data={} missing={} rpc_missing={} ready={} rpc_ready={}",
+            world_size, local_rank, local_shards_.size(), peer_handles_.size(),
+            peer_data.size(), missing_remote_shards.size(),
+@@ -456,17 +560,21 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+     }
+ 
+     // B-完整 duplex (2026-10-16): mailbox layout MUST match the worker QN's
+-    // EnsureRpcMailbox (milvus_ub_runtime.cpp:467) bit-for-bit, because the
+-    // peer's RequestOffset/RequestNotifyOffset/RequestSlot use the same
+-    // RpcMailboxConfig to compute physical offsets that this QN's WRITE_NOTIFY
+-    // WRs target. If the two sides disagree on ring_depth or request_capacity,
+-    // the WR writes payload at offset X (per local layout) but the peer reads
+-    // at offset Y (per its layout), gets stale bytes, and may abort with
+-    // URMA_CR_REM_ACCESS_ABORT_ERR when the WR overruns the peer's smaller
+-    // segment. cfg->rpc_request_batch_max_bytes auto-resolves to 65536 here
+-    // while EnsureRpcMailbox hardcodes 4096 — that mismatch caused the
+-    // end-to-end deadlock. Pin to the worker QN's hardcoded values; the cfg
+-    // values can be re-exposed once EnsureRpcMailbox reads them too.
++    // EnsureRpcMailbox bit-for-bit, because the peer's
++    // RequestOffset/RequestNotifyOffset/RequestSlot use the same
++    // RpcMailboxConfig to compute physical offsets that this QN's
++    // WRITE_NOTIFY WRs target. If the two sides disagree on ring_depth or
++    // request_capacity, the WR writes payload at offset X (per local layout)
++    // but the peer reads at offset Y (per its layout), gets stale bytes, and
++    // may abort with URMA_CR_REM_ACCESS_ABORT_ERR when the WR overruns the
++    // peer's smaller segment.
++    //
++    // The historical mismatch (EnsureRpcMailbox hard-coded 4096-byte cells
++    // while this transport used the resolved rpc_request_batch_max_bytes,
++    // >= 64 KiB) is what produced "request fragment batch output is too
++    // small" for every pushdown request. EnsureRpcMailbox now resolves the
++    // same plan through RequestedRuntimeConfig(), so both sides agree by
++    // construction; the check above still rejects a stale published mailbox.
+     // P2P-6A (2026-10-17): Do NOT create a second RpcMailboxMemory here.
+     // EnsureRpcMailbox already created one and published its regions to the
+     // URMA directory; peers WRITE_NOTIFY into THAT mailbox. A private second
+@@ -1630,6 +1738,10 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          LOG_INFO("UB M-6 RpcClientOwner::Create begin owner={}/{} lane={}",
                   owner, cfg->rpc_progress_threads,
                   cfg->read_progress_threads + owner);
@@ -262,7 +412,46 @@ index 0246f83..eba1bf0 100644
          auto client = RpcClientOwner::Create(
              owner, world_size, max_client_operations,
              state->rpc_distance->submissions(),
-@@ -1792,6 +1868,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1678,6 +1790,20 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+         }
+         state->rpc_transports.push_back(std::move(transport).value());
+         LOG_INFO("UB M-6 RpcTransportOwner::Create OK owner={}", owner);
++        // Pushdown wiring summary: a zero here is the usual reason "submitted
++        // but never posted" (no staging slot / no ring credit / no peer).
++        LOG_INFO(
++            "UB pushdown lane={} peers={} staging_slots={} response_slots={} "
++            "credit_slots={} ring_depth={} req_batch_max_bytes={} "
++            "req_stride={} req_mailbox_bytes={}",
++            owner, owner_map.value().rpc_owned_ranks[owner].size(),
++            cfg->rpc_memory.request_staging_slots_per_thread,
++            cfg->rpc_memory.response_staging_slots_per_thread,
++            cfg->rpc_memory.credit_staging_slots_per_thread,
++            requested.request_ring_depth,
++            cfg->rpc_request_batch_max_bytes,
++            cfg->rpc_memory.request_stride,
++            cfg->rpc_memory.request_mailbox_bytes);
+       }
+       LOG_INFO("UB M-6 RPC distance path active: {} rpc owners, max_client_ops={} "
+                "maximum_batch={} dim={}",
+@@ -1728,12 +1854,11 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+       try { threshold = static_cast<std::uint32_t>(std::stoul(env)); }
+       catch (...) {}
+     }
+-    // B-完整 duplex (2026-10-16): when rpc_ready and no env override,
+-    // default to pushdown so the RPC path is exercised end-to-end. The
+-    // legacy kAuto/pull_threshold=4 default routes small batches (entry
+-    // point id_count=1) to pull, which masks the pushdown path during
+-    // verification. Operators can opt out with UB_DISTANCE_POLICY=auto
+-    // or =pull.
++    // Pushdown is the target path: it sends ids and gets 4-byte distances
++    // back instead of pulling a full 3840-byte vector per distance (the pull
++    // path is ~1000x more READ traffic). Default to pushdown whenever the RPC
++    // tree is ready; UB_DISTANCE_POLICY=pull/auto are debugging escape
++    // hatches only.
+     if (rpc_ready && policy != DistancePolicy::kPushdown &&
+         std::getenv("UB_DISTANCE_POLICY") == nullptr) {
+       policy = DistancePolicy::kPushdown;
+@@ -1792,6 +1917,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      // Concurrency-evidence baseline for rate calculation.
      std::uint64_t last_admit = 0, last_tasks = 0;
      std::uint64_t last_read_sub = 0, last_read_cmpl = 0;
@@ -277,7 +466,7 @@ index 0246f83..eba1bf0 100644
      // Aggregate read counters across read_progress dispatchers.
      auto read_agg = [&]() -> std::pair<std::uint64_t, std::uint64_t> {
        std::uint64_t s = 0, c = 0;
-@@ -1806,6 +1890,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1806,6 +1939,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      };
      while (!stop.stop_requested()) {
        bool progressed = false;
@@ -285,7 +474,7 @@ index 0246f83..eba1bf0 100644
        auto hb_now = std::chrono::steady_clock::now();
        if (hb_now - last_heartbeat > std::chrono::seconds(2)) {
          const auto fifo_sz = [&]{ std::lock_guard<std::mutex> g(ctx->fifo_mutex); return ctx->fifo.size(); }();
-@@ -1899,48 +1984,73 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1899,48 +2033,73 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        while (auto done = ctx->queues->PopDone()) {
          const auto slot_index = done->query.query_slot;
          if (slot_index >= ctx->slot_records.size()) {
@@ -371,7 +560,7 @@ index 0246f83..eba1bf0 100644
          progressed = true;
        }
  
-@@ -1954,7 +2064,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1954,7 +2113,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
            }
            pending = std::move(ctx->fifo.front());
            ctx->fifo.pop_front();
@@ -380,7 +569,7 @@ index 0246f83..eba1bf0 100644
                    static_cast<unsigned long long>(pending.req_id),
                    pending.topk, pending.ef_search,
                    pending.query.size(), meta->dim,
-@@ -1967,12 +2077,32 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1967,12 +2126,32 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                    static_cast<int>(key.status().code()),
                    key.status().message().c_str());
            if (key.status().code() == StatusCode::kResourceExhausted) {
@@ -414,7 +603,7 @@ index 0246f83..eba1bf0 100644
          record.completion = pending.completion;
  
          SearchParams params;
-@@ -1980,6 +2110,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1980,6 +2159,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          params.ef_search =
              pending.ef_search < pending.topk ? pending.topk
                                               : pending.ef_search;
@@ -429,7 +618,7 @@ index 0246f83..eba1bf0 100644
          params.entry_point = INVALID_NODE_ID;
          params.entry_level = -1;
  
-@@ -1999,8 +2137,9 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1999,8 +2186,9 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                    key.value().source_rank, meta->num_shards);
            auto released = ctx->slots->Release(key.value());
            (void)released;
@@ -441,7 +630,7 @@ index 0246f83..eba1bf0 100644
              std::lock_guard<std::mutex> guard(completion->mutex);
              completion->done = true;
              completion->success = false;
-@@ -2011,7 +2150,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2011,7 +2199,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          }
          record.storage = std::move(created).value();
          record.task.store(record.storage.get(), std::memory_order_release);
@@ -450,7 +639,7 @@ index 0246f83..eba1bf0 100644
                  static_cast<unsigned long long>(pending.req_id),
                  key.value().query_slot);
  
-@@ -2034,13 +2173,27 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2034,13 +2222,27 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
              std::this_thread::yield();
            }
            record.storage.reset();
@@ -480,7 +669,7 @@ index 0246f83..eba1bf0 100644
                    static_cast<unsigned long long>(pending.req_id),
                    key.value().query_slot, admission_cursor,
                    ctx->active_queries+1,
-@@ -2079,8 +2232,43 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2079,8 +2281,43 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          progressed = true;
        }
  
@@ -525,7 +714,7 @@ index 0246f83..eba1bf0 100644
        while (auto expired = ctx->deadlines->PopExpired(now)) {
          auto& record = *ctx->slot_records[expired->query.query_slot];
          auto* task = record.task.load(std::memory_order_acquire);
-@@ -2089,10 +2277,118 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2089,10 +2326,118 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
            (void)task->RequestFailure(TerminalOutcome::kTimedOut,
                                       StatusCode::kTimeout);
            record.deadline_expired = true;
@@ -644,7 +833,7 @@ index 0246f83..eba1bf0 100644
        // 4. Idle wait when nothing moved.
        if (!progressed) {
          std::unique_lock<std::mutex> guard(ctx->fifo_mutex);
-@@ -2107,6 +2403,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2107,6 +2452,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      SetCurrentDistanceSearchWorker(worker);
      auto last_heartbeat = std::chrono::steady_clock::now();
      std::uint64_t pop_attempts = 0;
@@ -652,7 +841,7 @@ index 0246f83..eba1bf0 100644
      fprintf(stderr, "[UB search worker=%u] starting\n", worker);
      while (!stop.stop_requested()) {
        // Drain RPC distance completion queues for this search worker.
-@@ -2118,7 +2415,17 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2118,7 +2464,17 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          auto lifecycle = ctx->rpc_distance->ProgressSearch(
              worker, 64, std::chrono::steady_clock::now());
          if (!lifecycle.ok()) {
@@ -671,7 +860,7 @@ index 0246f83..eba1bf0 100644
          }
        }
        // Drain this search worker's own deferred-ready ring. Mixed local +
-@@ -2140,7 +2447,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2140,7 +2496,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          std::this_thread::sleep_for(std::chrono::microseconds(200));
          continue;
        }
@@ -680,7 +869,7 @@ index 0246f83..eba1bf0 100644
                worker, runnable->query.query_slot,
                static_cast<int>(runnable->source));
        if (runnable->query.query_slot >= ctx->slot_records.size()) {
-@@ -2210,7 +2517,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2210,7 +2566,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                    record.pickup_ts - record.last_yield_ts).count();
          }
        }
@@ -689,7 +878,7 @@ index 0246f83..eba1bf0 100644
                worker, runnable->query.query_slot);
        ctx->loads->Publish(worker,
                            {ctx->queues->input_backlog(worker), true});
-@@ -2221,7 +2528,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2221,7 +2577,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          const auto step = task->Step();
          const auto step_end_ts = std::chrono::steady_clock::now();
          if (step_count < 5 || (step_count % 100) == 0) {
@@ -698,7 +887,7 @@ index 0246f83..eba1bf0 100644
                    worker, runnable->query.query_slot,
                    static_cast<int>(step),
                    static_cast<int>(task->run_state()),
-@@ -2338,9 +2645,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2338,9 +2694,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
              static_cast<const void*>(ctx->local_shard_for_rpc));
      auto& server = *ctx->rpc_server;
      const LocalShard& local_shard = *ctx->local_shard_for_rpc;
@@ -723,7 +912,7 @@ index 0246f83..eba1bf0 100644
        auto slot_opt = server.PopService(worker);
        if (!slot_opt.has_value()) {
          std::this_thread::sleep_for(std::chrono::microseconds(20));
-@@ -2355,10 +2676,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2355,10 +2725,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        if (!compute_status.ok()) {
          auto pub = server.PublishResult(
              worker, slot, compute_status.code());
@@ -752,7 +941,7 @@ index 0246f83..eba1bf0 100644
        }
      }
      return Status::Ok();
-@@ -2455,6 +2792,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2455,6 +2841,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      }
      auto last_hb = std::chrono::steady_clock::now();
      std::uint64_t last_submitted = 0, last_completed = 0;
@@ -760,7 +949,7 @@ index 0246f83..eba1bf0 100644
      auto last_activity = std::chrono::steady_clock::now();
      const auto spin_budget =
          std::chrono::microseconds(cfg->read_progress_spin_us);
-@@ -2466,6 +2804,19 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2466,6 +2853,19 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        const auto activity_after =
            ReadActivityValue(ctx->dispatchers[thread]->profile());
        const auto iteration_finished = std::chrono::steady_clock::now();
@@ -780,7 +969,7 @@ index 0246f83..eba1bf0 100644
        const auto hb_now2 = std::chrono::steady_clock::now();
        if (hb_now2 - last_hb > std::chrono::seconds(2)) {
          const auto& prof = ctx->dispatchers[thread]->profile();
-@@ -2481,9 +2832,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2481,9 +2881,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          last_hb = hb_now2;
        }
        (void)ctx->ready_publisher->Flush(thread, cfg->search_workers);
@@ -790,7 +979,7 @@ index 0246f83..eba1bf0 100644
        if (activity_after != activity_before) {
          last_activity = iteration_finished;
        } else if (auto* ready =
-@@ -2529,6 +2877,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2529,6 +2926,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      const auto spin_budget =
          std::chrono::microseconds(cfg->rpc_progress_spin_us);
      std::uint64_t iter_count = 0;
@@ -798,7 +987,7 @@ index 0246f83..eba1bf0 100644
      auto last_profile_dump = std::chrono::steady_clock::now();
      while (!stop.stop_requested()) {
        const auto iteration_started = std::chrono::steady_clock::now();
-@@ -2547,6 +2896,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2547,6 +2945,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
            cfg->read_progress_threads + thread, cfg->search_workers);
        const auto iteration_finished = std::chrono::steady_clock::now();
        ++iter_count;
@@ -822,7 +1011,7 @@ index 0246f83..eba1bf0 100644
        // Dump transport profile every 2s so we can see if requests are
        // being posted, completed, and whether peer responses arrive.
        // Key counters:
-@@ -2602,15 +2968,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2602,15 +3017,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                  static_cast<unsigned long>(p.request_post_tasks_left_pending),
                  peers_str.c_str());
          last_profile_dump = iteration_finished;
@@ -839,10 +1028,19 @@ index 0246f83..eba1bf0 100644
        // Adaptive wait: when idle for longer than spin_budget, block on
        // the submit/result notifications for up to 100us to free the core.
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
-index 92f8a39..c77d304 100644
+index 92f8a39..c157295 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
-@@ -286,13 +286,11 @@ Status MilvusUbRuntime::SearchEntry(std::uint64_t req_id,
+@@ -20,6 +20,8 @@
+ #include "hnsw_urma/core/status.hpp"
+ #include "hnsw_urma/core/types.hpp"
+ #include "hnsw_urma/index/format.hpp"
++#include "hnsw_urma/runtime/config.hpp"
++#include "hnsw_urma/runtime/topology.hpp"
+ #include "hnsw_urma/search/local_io.hpp"
+ #include "hnsw_urma/search/query_context.hpp"
+ #include "hnsw_urma/search/search.hpp"
+@@ -286,13 +288,11 @@ Status MilvusUbRuntime::SearchEntry(std::uint64_t req_id,
                                      bool force_main) {
    // State checks + dedupe under state_mutex_; release before the
    // completion wait so concurrent SearchEntry callers are not serialized
@@ -858,7 +1056,7 @@ index 92f8a39..c77d304 100644
      out_is_main = false;
      out_ids.assign(static_cast<std::size_t>(nq) * topk,
                     static_cast<std::int64_t>(INVALID_NODE_ID));
-@@ -354,48 +352,97 @@ Status MilvusUbRuntime::SearchEntry(std::uint64_t req_id,
+@@ -354,48 +354,97 @@ Status MilvusUbRuntime::SearchEntry(std::uint64_t req_id,
    // ---- state_mutex_ released ----
  
    if (dist_ctx != nullptr) {
@@ -954,11 +1152,11 @@ index 92f8a39..c77d304 100644
 +                dist_ctx->active_queries, dist_ctx->max_active_queries);
 +        return Status(StatusCode::kTimeout,
 +                      "UB batch entry timed out waiting for the scheduler");
-       }
--      const auto& neighbors = completion.result.neighbors;
++      }
 +      if (!completion.success && first_error.ok()) {
 +        first_error = completion.status;
-+      }
+       }
+-      const auto& neighbors = completion.result.neighbors;
 +    }
 +    if (!first_error.ok()) {
 +      // Every row was awaited, so no completion can still be in flight.
@@ -986,6 +1184,98 @@ index 92f8a39..c77d304 100644
      return Status::Ok();
    }
  
+@@ -456,7 +505,7 @@ Status MilvusUbRuntime::EnsureRpcMailbox() {
+   if (rpc_memory_) {
+     return Status::Ok();
+   }
+-  if (!meta_ || !shard_map_) {
++  if (!meta_ || !shard_map_ || local_shards_.empty()) {
+     return Status(StatusCode::kInternalError,
+                   "EnsureRpcMailbox: runtime not seeded");
+   }
+@@ -466,36 +515,61 @@ Status MilvusUbRuntime::EnsureRpcMailbox() {
+     return Status(StatusCode::kInternalError,
+                   "EnsureRpcMailbox: shard map is empty");
+   }
+-  // rpc_progress_threads: prefer staged knob; fall back to 1 when unset so
+-  // a single-owner configuration still publishes a usable mailbox.
+-  std::uint32_t rpc_threads = knobs_.rpc_progress_workers;
+-  if (rpc_threads == 0) {
+-    rpc_threads = 1;
+-  }
+-  // mailbox_depth and batch capacities use RuntimeConfig defaults; auto
+-  // resolution would need allowed_cpus/meta we already have, but the
+-  // defaults are the same values ResolveRuntimeConfig lands on for the
+-  // 8-QN 1-shard-per-QN topology, and EnsureRpcMailbox runs before that
+-  // resolution anyway. Keep the published mailbox identical to the one
+-  // EnableDistributedSearchLocked later reuses.
++  // The mailbox is registered and published to the URMA directory here, long
++  // before EnableDistributedSearchLocked builds the transport; that transport
++  // then reuses this memory. Sizing it from hard-coded 4 KiB cells made every
++  // distance request larger than the staging slot and produced
++  // "request fragment batch output is too small" on the wire (a single task
++  // already carries a dim*4 query vector: 3840 B for dim=960, plus ids and the
++  // fragment table). Resolve the real plan instead, exactly as
++  // EnableDistributedSearchLocked does.
++  RuntimeConfig requested = RequestedRuntimeConfig();
++  std::vector<std::uint32_t> allowed_cpus = knobs_.allowed_cpus;
++  if (allowed_cpus.empty()) {
++    allowed_cpus = DetectPlacement().allowed_cpus;
++  }
++  std::uint32_t local_rank = std::numeric_limits<std::uint32_t>::max();
++  for (auto sid : loaded_shard_ids_) {
++    local_rank = std::min(local_rank, static_cast<std::uint32_t>(sid));
++  }
++  auto effective = ResolveRuntimeConfig(requested, *meta_, world_size,
++                                        allowed_cpus, local_rank);
++  if (!effective.ok()) {
++    return effective.status();
++  }
++  const auto& plan = effective.value();
++  if (plan.rpc_memory.request_staging_slots_per_thread == 0 ||
++      plan.rpc_memory.response_staging_slots_per_thread == 0 ||
++      plan.rpc_memory.credit_staging_slots_per_thread == 0 ||
++      plan.rpc_request_batch_max_bytes == 0 ||
++      plan.rpc_response_batch_max_bytes == 0) {
++    return Status(StatusCode::kResourceExhausted,
++                  "EnsureRpcMailbox: RPC memory plan is empty");
++  }
+   RpcMailboxConfig config;
+   config.world_size = world_size;
+-  config.rpc_threads = rpc_threads;
+-  config.ring_depth = 8;          // RuntimeConfig::request_ring_depth default
+-  config.request_capacity = 4096; // rpc_request_batch_max_bytes auto-resolved
+-  config.response_capacity = 4096;
+-  config.request_staging_slots_per_thread = 4;
+-  config.response_staging_slots_per_thread = 4;
+-  config.credit_staging_slots_per_thread = 8;
++  config.rpc_threads = plan.rpc_progress_threads;
++  config.ring_depth = requested.request_ring_depth;
++  config.request_capacity = plan.rpc_request_batch_max_bytes;
++  config.response_capacity = plan.rpc_response_batch_max_bytes;
++  config.request_staging_slots_per_thread =
++      plan.rpc_memory.request_staging_slots_per_thread;
++  config.response_staging_slots_per_thread =
++      plan.rpc_memory.response_staging_slots_per_thread;
++  config.credit_staging_slots_per_thread =
++      plan.rpc_memory.credit_staging_slots_per_thread;
+   auto mailbox = RpcMailboxMemory::Create(config);
+   if (!mailbox.ok()) {
+     return mailbox.status();
+   }
+   rpc_memory_ = std::move(mailbox).value();
+   LOG_INFO("UB EnsureRpcMailbox: world_size={} rpc_threads={} ring_depth={} "
+-           "request_cap={} response_cap={} bytes={}",
+-           world_size, rpc_threads, config.ring_depth,
++           "request_cap={} response_cap={} staging={}/{}/{} bytes={}",
++           world_size, config.rpc_threads, config.ring_depth,
+            config.request_capacity, config.response_capacity,
++           config.request_staging_slots_per_thread,
++           config.response_staging_slots_per_thread,
++           config.credit_staging_slots_per_thread,
+            rpc_memory_->logical_bytes());
+   return Status::Ok();
+ }
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/distance_oracle.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/distance_oracle.cpp
 index 0099f80..62dbc4e 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/distance_oracle.cpp
@@ -1007,6 +1297,25 @@ index 0099f80..62dbc4e 100644
              "[UB ProgressSearch] popped completion slot=%u ticket=%llu sw=%u\n",
              event->slot,
              static_cast<unsigned long long>(event->ticket),
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/transport.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/transport.cpp
+index d9d72f4..874750e 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/transport.cpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/transport.cpp
+@@ -1825,6 +1825,14 @@ Status RpcTransportOwner::Progress() {
+                   .count());
+     }
+     if (!status.ok()) {
++      // Name the stage that failed. SetFatal() makes the status sticky, so
++      // after the first failure nothing else runs for this lane; without this
++      // line the only trace is a generic "lane error" and the stage is lost.
++      fprintf(stderr,
++              "[UB transport owner=%u] step=%zu failed: code=%s msg=%s\n",
++              config_.owner_thread, index,
++              std::string(StatusCodeName(status.code())).c_str(),
++              status.message().c_str());
+       return status;
+     }
+   }
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
 index 01545aa..7d96b47 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/search/search.cpp
