@@ -148,7 +148,7 @@ index 36e08c1..fb5906c 100644
  //
  // UbLoadShard moves ownership of an already-loaded hnsw_urma::LoadedIndex
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
-index 0246f83..6a33b55 100644
+index 0246f83..eba1bf0 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
 @@ -50,6 +50,7 @@
@@ -251,35 +251,18 @@ index 0246f83..6a33b55 100644
    state->metric = readers_metric_;
    state->eff_search_workers = cfg->search_workers;
    state->eff_read_progress_threads = cfg->read_progress_threads;
-@@ -1630,10 +1702,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1630,6 +1702,10 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          LOG_INFO("UB M-6 RpcClientOwner::Create begin owner={}/{} lane={}",
                   owner, cfg->rpc_progress_threads,
                   cfg->read_progress_threads + owner);
-+        // One in-flight query can hold one task per remote peer this owner
-+        // serves, so the per-owner in-flight bound must cover every
-+        // (query, peer) pair. Sizing it to max_active_queries alone capped a
-+        // busy owner at one task per query: with N concurrent queries the
-+        // owner rejected (N*peers - N) tasks as kResourceExhausted, which the
-+        // search path turns into 50us retry churn instead of progress.
-+        const auto served_peers = static_cast<std::uint32_t>(
-+            std::max<std::size_t>(1U, owner_map.value().rpc_owned_ranks[owner].size()));
-+        const std::uint64_t pending_bound_64 =
-+            static_cast<std::uint64_t>(requested.max_active_queries) *
-+            served_peers;
-+        const auto owner_pending_capacity = static_cast<std::uint32_t>(
-+            std::min<std::uint64_t>(
-+                pending_bound_64,
-+                std::max<std::uint64_t>(
-+                    1U, std::numeric_limits<std::uint32_t>::max())));
++        // Argument order matters: pending_capacity is the per-owner in-flight
++        // task bound (already max_active_queries * (world-1) via
++        // max_client_operations), query_slots sizes the per-peer query cache
++        // and must stay at the slot count.
          auto client = RpcClientOwner::Create(
              owner, world_size, max_client_operations,
              state->rpc_distance->submissions(),
--            requested.max_active_queries, requested.profile,
-+            owner_pending_capacity, requested.profile,
-             state->rpc_distance.get());
-         if (!client.ok()) {
-           LOG_ERROR("UB M-6 RpcClientOwner::Create failed owner={}: {}",
-@@ -1792,6 +1880,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1792,6 +1868,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      // Concurrency-evidence baseline for rate calculation.
      std::uint64_t last_admit = 0, last_tasks = 0;
      std::uint64_t last_read_sub = 0, last_read_cmpl = 0;
@@ -294,7 +277,7 @@ index 0246f83..6a33b55 100644
      // Aggregate read counters across read_progress dispatchers.
      auto read_agg = [&]() -> std::pair<std::uint64_t, std::uint64_t> {
        std::uint64_t s = 0, c = 0;
-@@ -1806,6 +1902,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1806,6 +1890,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      };
      while (!stop.stop_requested()) {
        bool progressed = false;
@@ -302,7 +285,7 @@ index 0246f83..6a33b55 100644
        auto hb_now = std::chrono::steady_clock::now();
        if (hb_now - last_heartbeat > std::chrono::seconds(2)) {
          const auto fifo_sz = [&]{ std::lock_guard<std::mutex> g(ctx->fifo_mutex); return ctx->fifo.size(); }();
-@@ -1899,48 +1996,73 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1899,48 +1984,73 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        while (auto done = ctx->queues->PopDone()) {
          const auto slot_index = done->query.query_slot;
          if (slot_index >= ctx->slot_records.size()) {
@@ -388,7 +371,7 @@ index 0246f83..6a33b55 100644
          progressed = true;
        }
  
-@@ -1954,7 +2076,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1954,7 +2064,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
            }
            pending = std::move(ctx->fifo.front());
            ctx->fifo.pop_front();
@@ -397,7 +380,7 @@ index 0246f83..6a33b55 100644
                    static_cast<unsigned long long>(pending.req_id),
                    pending.topk, pending.ef_search,
                    pending.query.size(), meta->dim,
-@@ -1967,12 +2089,32 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1967,12 +2077,32 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                    static_cast<int>(key.status().code()),
                    key.status().message().c_str());
            if (key.status().code() == StatusCode::kResourceExhausted) {
@@ -431,7 +414,7 @@ index 0246f83..6a33b55 100644
          record.completion = pending.completion;
  
          SearchParams params;
-@@ -1980,6 +2122,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1980,6 +2110,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          params.ef_search =
              pending.ef_search < pending.topk ? pending.topk
                                               : pending.ef_search;
@@ -446,7 +429,7 @@ index 0246f83..6a33b55 100644
          params.entry_point = INVALID_NODE_ID;
          params.entry_level = -1;
  
-@@ -1999,8 +2149,9 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1999,8 +2137,9 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                    key.value().source_rank, meta->num_shards);
            auto released = ctx->slots->Release(key.value());
            (void)released;
@@ -458,7 +441,7 @@ index 0246f83..6a33b55 100644
              std::lock_guard<std::mutex> guard(completion->mutex);
              completion->done = true;
              completion->success = false;
-@@ -2011,7 +2162,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2011,7 +2150,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          }
          record.storage = std::move(created).value();
          record.task.store(record.storage.get(), std::memory_order_release);
@@ -467,7 +450,7 @@ index 0246f83..6a33b55 100644
                  static_cast<unsigned long long>(pending.req_id),
                  key.value().query_slot);
  
-@@ -2034,13 +2185,27 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2034,13 +2173,27 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
              std::this_thread::yield();
            }
            record.storage.reset();
@@ -497,7 +480,7 @@ index 0246f83..6a33b55 100644
                    static_cast<unsigned long long>(pending.req_id),
                    key.value().query_slot, admission_cursor,
                    ctx->active_queries+1,
-@@ -2079,8 +2244,43 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2079,8 +2232,43 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          progressed = true;
        }
  
@@ -542,7 +525,7 @@ index 0246f83..6a33b55 100644
        while (auto expired = ctx->deadlines->PopExpired(now)) {
          auto& record = *ctx->slot_records[expired->query.query_slot];
          auto* task = record.task.load(std::memory_order_acquire);
-@@ -2089,10 +2289,98 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2089,10 +2277,118 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
            (void)task->RequestFailure(TerminalOutcome::kTimedOut,
                                       StatusCode::kTimeout);
            record.deadline_expired = true;
@@ -631,6 +614,26 @@ index 0246f83..6a33b55 100644
 +                    static_cast<unsigned long long>(profile.failed),
 +                    static_cast<unsigned long long>(profile.slots_in_use),
 +                    static_cast<unsigned long long>(profile.active_audit_passes));
++            // published>consumed means the search side queued a task the RPC
++            // owner never drained; published==consumed with nothing posted
++            // means the transport never got it to the wire.
++            const auto matrix = ctx->rpc_distance->submissions().profile();
++            fprintf(stderr,
++                    "[UB stall] rpc matrix published=%llu consumed=%llu "
++                    "full=%llu high_watermark=%llu\n",
++                    static_cast<unsigned long long>(matrix.published),
++                    static_cast<unsigned long long>(matrix.consumed),
++                    static_cast<unsigned long long>(matrix.full_count),
++                    static_cast<unsigned long long>(matrix.high_watermark));
++            for (std::size_t lane = 0; lane < ctx->rpc_clients.size(); ++lane) {
++              const auto* client = ctx->rpc_clients[lane].get();
++              if (client == nullptr) {
++                continue;
++              }
++              fprintf(stderr, "[UB stall] rpc lane=%u drained=%d\n",
++                      static_cast<unsigned>(lane),
++                      static_cast<int>(client->drained()));
++            }
 +          }
 +        }
 +      } else {
@@ -641,7 +644,7 @@ index 0246f83..6a33b55 100644
        // 4. Idle wait when nothing moved.
        if (!progressed) {
          std::unique_lock<std::mutex> guard(ctx->fifo_mutex);
-@@ -2107,6 +2395,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2107,6 +2403,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      SetCurrentDistanceSearchWorker(worker);
      auto last_heartbeat = std::chrono::steady_clock::now();
      std::uint64_t pop_attempts = 0;
@@ -649,7 +652,7 @@ index 0246f83..6a33b55 100644
      fprintf(stderr, "[UB search worker=%u] starting\n", worker);
      while (!stop.stop_requested()) {
        // Drain RPC distance completion queues for this search worker.
-@@ -2118,7 +2407,17 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2118,7 +2415,17 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          auto lifecycle = ctx->rpc_distance->ProgressSearch(
              worker, 64, std::chrono::steady_clock::now());
          if (!lifecycle.ok()) {
@@ -668,7 +671,7 @@ index 0246f83..6a33b55 100644
          }
        }
        // Drain this search worker's own deferred-ready ring. Mixed local +
-@@ -2140,7 +2439,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2140,7 +2447,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          std::this_thread::sleep_for(std::chrono::microseconds(200));
          continue;
        }
@@ -677,7 +680,7 @@ index 0246f83..6a33b55 100644
                worker, runnable->query.query_slot,
                static_cast<int>(runnable->source));
        if (runnable->query.query_slot >= ctx->slot_records.size()) {
-@@ -2210,7 +2509,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2210,7 +2517,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                    record.pickup_ts - record.last_yield_ts).count();
          }
        }
@@ -686,7 +689,7 @@ index 0246f83..6a33b55 100644
                worker, runnable->query.query_slot);
        ctx->loads->Publish(worker,
                            {ctx->queues->input_backlog(worker), true});
-@@ -2221,7 +2520,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2221,7 +2528,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          const auto step = task->Step();
          const auto step_end_ts = std::chrono::steady_clock::now();
          if (step_count < 5 || (step_count % 100) == 0) {
@@ -695,7 +698,7 @@ index 0246f83..6a33b55 100644
                    worker, runnable->query.query_slot,
                    static_cast<int>(step),
                    static_cast<int>(task->run_state()),
-@@ -2338,9 +2637,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2338,9 +2645,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
              static_cast<const void*>(ctx->local_shard_for_rpc));
      auto& server = *ctx->rpc_server;
      const LocalShard& local_shard = *ctx->local_shard_for_rpc;
@@ -720,7 +723,7 @@ index 0246f83..6a33b55 100644
        auto slot_opt = server.PopService(worker);
        if (!slot_opt.has_value()) {
          std::this_thread::sleep_for(std::chrono::microseconds(20));
-@@ -2355,10 +2668,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2355,10 +2676,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        if (!compute_status.ok()) {
          auto pub = server.PublishResult(
              worker, slot, compute_status.code());
@@ -749,7 +752,7 @@ index 0246f83..6a33b55 100644
        }
      }
      return Status::Ok();
-@@ -2455,6 +2784,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2455,6 +2792,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      }
      auto last_hb = std::chrono::steady_clock::now();
      std::uint64_t last_submitted = 0, last_completed = 0;
@@ -757,7 +760,7 @@ index 0246f83..6a33b55 100644
      auto last_activity = std::chrono::steady_clock::now();
      const auto spin_budget =
          std::chrono::microseconds(cfg->read_progress_spin_us);
-@@ -2466,6 +2796,19 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2466,6 +2804,19 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        const auto activity_after =
            ReadActivityValue(ctx->dispatchers[thread]->profile());
        const auto iteration_finished = std::chrono::steady_clock::now();
@@ -777,7 +780,7 @@ index 0246f83..6a33b55 100644
        const auto hb_now2 = std::chrono::steady_clock::now();
        if (hb_now2 - last_hb > std::chrono::seconds(2)) {
          const auto& prof = ctx->dispatchers[thread]->profile();
-@@ -2481,9 +2824,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2481,9 +2832,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          last_hb = hb_now2;
        }
        (void)ctx->ready_publisher->Flush(thread, cfg->search_workers);
@@ -787,6 +790,54 @@ index 0246f83..6a33b55 100644
        if (activity_after != activity_before) {
          last_activity = iteration_finished;
        } else if (auto* ready =
+@@ -2529,6 +2877,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+     const auto spin_budget =
+         std::chrono::microseconds(cfg->rpc_progress_spin_us);
+     std::uint64_t iter_count = 0;
++    std::uint64_t lane_errors = 0;
+     auto last_profile_dump = std::chrono::steady_clock::now();
+     while (!stop.stop_requested()) {
+       const auto iteration_started = std::chrono::steady_clock::now();
+@@ -2547,6 +2896,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+           cfg->read_progress_threads + thread, cfg->search_workers);
+       const auto iteration_finished = std::chrono::steady_clock::now();
+       ++iter_count;
++      // A transport fatal must not take the whole runtime down:
++      // RuntimeThreadGroup::RecordFailure stops EVERY thread, which turns one
++      // bad lane into a permanent, silent hang for all later searches. Log it
++      // immediately (the heartbeat may never run), then keep the lane alive so
++      // the scheduler's deadline + escalation can fail the affected queries.
++      if (!status.ok()) {
++        ++lane_errors;
++        if (lane_errors <= 10 || (lane_errors % 1000) == 0) {
++          fprintf(stderr,
++                  "[UB rpc_progress %u] lane error (%llu): code=%s msg=%s\n",
++                  thread, static_cast<unsigned long long>(lane_errors),
++                  std::string(StatusCodeName(status.code())).c_str(),
++                  status.message().c_str());
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        continue;
++      }
+       // Dump transport profile every 2s so we can see if requests are
+       // being posted, completed, and whether peer responses arrive.
+       // Key counters:
+@@ -2602,15 +2968,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+                 static_cast<unsigned long>(p.request_post_tasks_left_pending),
+                 peers_str.c_str());
+         last_profile_dump = iteration_finished;
+-        if (!status.ok()) {
+-          fprintf(stderr,
+-                  "[UB rpc_progress %u] FATAL status=%s msg=%s\n",
+-                  thread, std::string(StatusCodeName(status.code())).c_str(),
+-                  status.message().c_str());
+-        }
+-      }
+-      if (!status.ok()) {
+-        return status;
+       }
+       // Adaptive wait: when idle for longer than spin_budget, block on
+       // the submit/result notifications for up to 100us to free the core.
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
 index 92f8a39..c77d304 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
