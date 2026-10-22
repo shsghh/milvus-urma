@@ -134,6 +134,26 @@ index f047e1b..be27b85 100644
    Metric metric{Metric::kL2};
  
    // ---- Concurrency-evidence counters (added for Go worker pool diagnosis).
+diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/runtime/config.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/runtime/config.hpp
+index b53fe67..2a30467 100644
+--- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/runtime/config.hpp
++++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/runtime/config.hpp
+@@ -88,7 +88,14 @@ struct RuntimeConfig {
+   AutoU32 request_jfc_depth;
+   AutoU32 response_jfc_depth;
+   std::uint32_t wr_list_max{8};
+-  std::uint32_t request_ring_depth{8};
++  // Per-peer request ring / credit window. The distance path keeps one
++  // in-flight request per (query, peer); with 8 QNs and nq=100 a single lane
++  // can own a whole peer (owner map 2/2/2/1), so a window of 8 is smaller than
++  // the number of concurrent queries and the window closes until the peer
++  // advertises released leases. 32 keeps a 100-query batch inside the window.
++  // Memory cost per QN: world*ring*request_stride for the mailbox (8*32*64KiB
++  // = 16 MiB) plus rpc_threads*ring*(world-1) staging slots.
++  std::uint32_t request_ring_depth{32};
+   AutoU32 query_cache_entries;
+   // Deterministic startup ceilings. Providers do not expose a portable
+   // registered-memory byte limit, so operators may lower these per host.
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
 index 36e08c1..fb5906c 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/ub_c_api.h
@@ -161,7 +181,7 @@ index 36e08c1..fb5906c 100644
  //
  // UbLoadShard moves ownership of an already-loaded hnsw_urma::LoadedIndex
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
-index 0246f83..8263038 100644
+index 0246f83..a9dae68 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
 @@ -50,6 +50,7 @@
@@ -1011,7 +1031,7 @@ index 0246f83..8263038 100644
        // Dump transport profile every 2s so we can see if requests are
        // being posted, completed, and whether peer responses arrive.
        // Key counters:
-@@ -2602,15 +3017,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2602,15 +3017,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                  static_cast<unsigned long>(p.request_post_tasks_left_pending),
                  peers_str.c_str());
          last_profile_dump = iteration_finished;
@@ -1024,11 +1044,28 @@ index 0246f83..8263038 100644
 -      }
 -      if (!status.ok()) {
 -        return status;
++        // Server-role view of the same lane: whether the peer's requests
++        // arrive, whether the slot reservation rejects them
++        // (reserve_rejects > 0 means the client's window cannot be served
++        // here), and whether results are drained. Without this the requester
++        // only sees "no credit", which is a symptom, not a cause.
++        const auto svc = ctx->rpc_server->queue_profile();
++        fprintf(stderr,
++                "[UB svc owner=%u svc_pub=%llu svc_cons=%llu res_pub=%llu "
++                "res_cons=%llu reserve_rejects=%llu svc_hwm=%llu res_hwm=%llu\n",
++                thread,
++                static_cast<unsigned long long>(svc.service_published),
++                static_cast<unsigned long long>(svc.service_consumed),
++                static_cast<unsigned long long>(svc.result_published),
++                static_cast<unsigned long long>(svc.result_consumed),
++                static_cast<unsigned long long>(svc.reservation_rejects),
++                static_cast<unsigned long long>(svc.service_high_watermark),
++                static_cast<unsigned long long>(svc.result_high_watermark));
        }
        // Adaptive wait: when idle for longer than spin_budget, block on
        // the submit/result notifications for up to 100us to free the core.
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
-index 92f8a39..c157295 100644
+index 92f8a39..67630a0 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_ub_runtime.cpp
 @@ -20,6 +20,8 @@
@@ -1152,11 +1189,11 @@ index 92f8a39..c157295 100644
 +                dist_ctx->active_queries, dist_ctx->max_active_queries);
 +        return Status(StatusCode::kTimeout,
 +                      "UB batch entry timed out waiting for the scheduler");
-+      }
-+      if (!completion.success && first_error.ok()) {
-+        first_error = completion.status;
        }
 -      const auto& neighbors = completion.result.neighbors;
++      if (!completion.success && first_error.ok()) {
++        first_error = completion.status;
++      }
 +    }
 +    if (!first_error.ok()) {
 +      // Every row was awaited, so no completion can still be in flight.
@@ -1193,7 +1230,7 @@ index 92f8a39..c157295 100644
      return Status(StatusCode::kInternalError,
                    "EnsureRpcMailbox: runtime not seeded");
    }
-@@ -466,36 +515,61 @@ Status MilvusUbRuntime::EnsureRpcMailbox() {
+@@ -466,36 +515,67 @@ Status MilvusUbRuntime::EnsureRpcMailbox() {
      return Status(StatusCode::kInternalError,
                    "EnsureRpcMailbox: shard map is empty");
    }
@@ -1218,9 +1255,15 @@ index 92f8a39..c157295 100644
 +  // fragment table). Resolve the real plan instead, exactly as
 +  // EnableDistributedSearchLocked does.
 +  RuntimeConfig requested = RequestedRuntimeConfig();
++  // The Milvus build has no MPI placement detection (DetectPlacement is a
++  // stub returning an empty list); Go always stages the CPU set through
++  // UbSetConfig (cgroup / yaml / numa). Without it the plan cannot be
++  // resolved, so fail with a clear message instead of guessing.
 +  std::vector<std::uint32_t> allowed_cpus = knobs_.allowed_cpus;
 +  if (allowed_cpus.empty()) {
-+    allowed_cpus = DetectPlacement().allowed_cpus;
++    return Status(StatusCode::kInvalidArgument,
++                  "EnsureRpcMailbox: queryNode.ub allowedCpus is empty; "
++                  "cannot resolve the RPC mailbox plan");
 +  }
 +  std::uint32_t local_rank = std::numeric_limits<std::uint32_t>::max();
 +  for (auto sid : loaded_shard_ids_) {
@@ -1298,10 +1341,44 @@ index 0099f80..62dbc4e 100644
              event->slot,
              static_cast<unsigned long long>(event->ticket),
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/transport.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/transport.cpp
-index d9d72f4..874750e 100644
+index d9d72f4..c2539cb 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/transport.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/runtime/rpc/transport.cpp
-@@ -1825,6 +1825,14 @@ Status RpcTransportOwner::Progress() {
+@@ -1645,6 +1645,33 @@ Status RpcTransportOwner::PostRequests() {
+     profile_.request_post_ring_credit_waits += ring_credit_waits;
+     profile_.request_post_tx_unavailable += tx_unavailable;
+   }
++  // Idle diagnosis: active peers but nothing posted is the "peer never gets
++  // its request" shape. Name the gate instead of letting it spin silently
++  // (post_peer_visits growth with zero physical writes is otherwise opaque).
++  if (posted == 0 && !active_peers.empty()) {
++    static std::atomic<std::uint64_t> g_post_req_idle{0};
++    const auto idle = g_post_req_idle.fetch_add(1, std::memory_order_relaxed) + 1;
++    if ((idle & 0x3FF) == 0) {
++      fprintf(stderr,
++              "[UB PostReq] idle owner=%u active_peers=%zu posted=0 "
++              "staging_unavailable=%llu ring_credit_waits=%llu "
++              "tx_unavailable=%llu peer_visits=%llu left_pending=%llu "
++              "ring_depth=%u\n",
++              config_.owner_thread, active_peers.size(),
++              static_cast<unsigned long long>(staging_unavailable),
++              static_cast<unsigned long long>(ring_credit_waits),
++              static_cast<unsigned long long>(tx_unavailable),
++              static_cast<unsigned long long>(profile_.request_post_peer_visits),
++              static_cast<unsigned long long>(
++                  profile_.request_post_tasks_left_pending),
++              static_cast<unsigned>(memory_->config().ring_depth));
++    }
++    // Do not burn a core spinning on a peer that cannot take a request right
++    // now (nq=100 turned this into ~1M peer visits per second).
++    if ((idle & 0x3F) == 0) {
++      std::this_thread::sleep_for(std::chrono::microseconds(50));
++    }
++  }
+   return Status::Ok();
+ }
+ 
+@@ -1825,6 +1852,14 @@ Status RpcTransportOwner::Progress() {
                    .count());
      }
      if (!status.ok()) {
