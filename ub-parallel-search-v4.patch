@@ -66,7 +66,7 @@ index 2abcde0..a38003c 100644
  
    // Returns a snapshot of the staged knobs (thread-safe). Values are those
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
-index f047e1b..2b6f95c 100644
+index f047e1b..be27b85 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/include/hnsw_urma/milvus_ub_runtime_impl.hpp
 @@ -57,7 +57,14 @@ struct MilvusUbRuntime::DistributedState {
@@ -105,13 +105,16 @@ index f047e1b..2b6f95c 100644
      // Concurrency-evidence: admit timestamp (set by control thread under
      // admission, read by search worker at pickup). Not atomic — the slot
      // is owned by control until task.store publishes the task, then by
-@@ -176,6 +190,12 @@ struct MilvusUbRuntime::DistributedState {
+@@ -176,6 +190,15 @@ struct MilvusUbRuntime::DistributedState {
    std::deque<PendingQuery> fifo;
    std::uint32_t max_active_queries{0};
    std::uint32_t active_queries{0};
 +  // Per-query wall clock used by the control lane and by SearchEntry's wait
 +  // bound (resolve from RuntimeConfig at enable time).
 +  std::uint32_t query_timeout_ms{30000};
++  // Per-attempt (phase) budget, mirrored into SearchParams so the task's own
++  // deadline arm matches the scheduler's.
++  std::uint32_t operation_timeout_ms{5000};
 +  // Queries reaped (PopDone) since startup: the control lane uses it to tell
 +  // "slow" from "wedged" when it reports a stall.
 +  std::uint64_t done_total{0};
@@ -145,7 +148,7 @@ index 36e08c1..fb5906c 100644
  //
  // UbLoadShard moves ownership of an already-loaded hnsw_urma::LoadedIndex
 diff --git a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
-index 0246f83..f757fdc 100644
+index 0246f83..6a33b55 100644
 --- a/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
 +++ b/internal/core/src/index/ub_hnsw/urma_runtime/src/milvus_distributed_runtime.cpp
 @@ -50,6 +50,7 @@
@@ -239,15 +242,16 @@ index 0246f83..f757fdc 100644
    }
  
    std::vector<std::uint32_t> allowed_cpus = knobs_.allowed_cpus;
-@@ -239,6 +309,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -239,6 +309,8 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
    state->effective = std::move(effective).value();
    const auto* cfg = &*state->effective;
    state->max_active_queries = requested.max_active_queries;
 +  state->query_timeout_ms = requested.query_timeout_ms;
++  state->operation_timeout_ms = requested.operation_timeout_ms;
    state->metric = readers_metric_;
    state->eff_search_workers = cfg->search_workers;
    state->eff_read_progress_threads = cfg->read_progress_threads;
-@@ -1630,10 +1701,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1630,10 +1702,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          LOG_INFO("UB M-6 RpcClientOwner::Create begin owner={}/{} lane={}",
                   owner, cfg->rpc_progress_threads,
                   cfg->read_progress_threads + owner);
@@ -275,7 +279,7 @@ index 0246f83..f757fdc 100644
              state->rpc_distance.get());
          if (!client.ok()) {
            LOG_ERROR("UB M-6 RpcClientOwner::Create failed owner={}: {}",
-@@ -1792,6 +1879,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1792,6 +1880,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      // Concurrency-evidence baseline for rate calculation.
      std::uint64_t last_admit = 0, last_tasks = 0;
      std::uint64_t last_read_sub = 0, last_read_cmpl = 0;
@@ -290,7 +294,7 @@ index 0246f83..f757fdc 100644
      // Aggregate read counters across read_progress dispatchers.
      auto read_agg = [&]() -> std::pair<std::uint64_t, std::uint64_t> {
        std::uint64_t s = 0, c = 0;
-@@ -1806,6 +1901,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1806,6 +1902,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      };
      while (!stop.stop_requested()) {
        bool progressed = false;
@@ -298,7 +302,7 @@ index 0246f83..f757fdc 100644
        auto hb_now = std::chrono::steady_clock::now();
        if (hb_now - last_heartbeat > std::chrono::seconds(2)) {
          const auto fifo_sz = [&]{ std::lock_guard<std::mutex> g(ctx->fifo_mutex); return ctx->fifo.size(); }();
-@@ -1899,48 +1995,73 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1899,48 +1996,73 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        while (auto done = ctx->queues->PopDone()) {
          const auto slot_index = done->query.query_slot;
          if (slot_index >= ctx->slot_records.size()) {
@@ -384,7 +388,7 @@ index 0246f83..f757fdc 100644
          progressed = true;
        }
  
-@@ -1954,7 +2075,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1954,7 +2076,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
            }
            pending = std::move(ctx->fifo.front());
            ctx->fifo.pop_front();
@@ -393,7 +397,7 @@ index 0246f83..f757fdc 100644
                    static_cast<unsigned long long>(pending.req_id),
                    pending.topk, pending.ef_search,
                    pending.query.size(), meta->dim,
-@@ -1967,12 +2088,32 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1967,12 +2089,32 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                    static_cast<int>(key.status().code()),
                    key.status().message().c_str());
            if (key.status().code() == StatusCode::kResourceExhausted) {
@@ -427,21 +431,34 @@ index 0246f83..f757fdc 100644
          record.completion = pending.completion;
  
          SearchParams params;
-@@ -1980,6 +2121,13 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1980,6 +2122,14 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          params.ef_search =
              pending.ef_search < pending.topk ? pending.topk
                                               : pending.ef_search;
 +        // Keep the task's own deadlines in sync with the scheduler's: the
 +        // task deadline arm is what makes a stalled phase re-attempt and
-+        // eventually fail instead of sitting in BeginWait.
++        // eventually fail instead of sitting in BeginWait. Read them from the
++        // runtime state (the lambda does not capture `requested`).
 +        params.operation_timeout =
-+            std::chrono::milliseconds(requested.operation_timeout_ms);
++            std::chrono::milliseconds(ctx->operation_timeout_ms);
 +        params.query_timeout =
-+            std::chrono::milliseconds(requested.query_timeout_ms);
++            std::chrono::milliseconds(ctx->query_timeout_ms);
          params.entry_point = INVALID_NODE_ID;
          params.entry_level = -1;
  
-@@ -2011,7 +2159,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -1999,8 +2149,9 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+                   key.value().source_rank, meta->num_shards);
+           auto released = ctx->slots->Release(key.value());
+           (void)released;
+-          if (auto* completion = record.completion) {
+-            record.completion = nullptr;
++          if (record.completion) {
++            auto completion = record.completion;
++            record.completion.reset();
+             std::lock_guard<std::mutex> guard(completion->mutex);
+             completion->done = true;
+             completion->success = false;
+@@ -2011,7 +2162,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          }
          record.storage = std::move(created).value();
          record.task.store(record.storage.get(), std::memory_order_release);
@@ -450,7 +467,7 @@ index 0246f83..f757fdc 100644
                  static_cast<unsigned long long>(pending.req_id),
                  key.value().query_slot);
  
-@@ -2034,13 +2182,27 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2034,13 +2185,27 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
              std::this_thread::yield();
            }
            record.storage.reset();
@@ -480,7 +497,7 @@ index 0246f83..f757fdc 100644
                    static_cast<unsigned long long>(pending.req_id),
                    key.value().query_slot, admission_cursor,
                    ctx->active_queries+1,
-@@ -2079,8 +2241,43 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2079,8 +2244,43 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          progressed = true;
        }
  
@@ -525,7 +542,7 @@ index 0246f83..f757fdc 100644
        while (auto expired = ctx->deadlines->PopExpired(now)) {
          auto& record = *ctx->slot_records[expired->query.query_slot];
          auto* task = record.task.load(std::memory_order_acquire);
-@@ -2089,10 +2286,98 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2089,10 +2289,98 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
            (void)task->RequestFailure(TerminalOutcome::kTimedOut,
                                       StatusCode::kTimeout);
            record.deadline_expired = true;
@@ -624,7 +641,7 @@ index 0246f83..f757fdc 100644
        // 4. Idle wait when nothing moved.
        if (!progressed) {
          std::unique_lock<std::mutex> guard(ctx->fifo_mutex);
-@@ -2107,6 +2392,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2107,6 +2395,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      SetCurrentDistanceSearchWorker(worker);
      auto last_heartbeat = std::chrono::steady_clock::now();
      std::uint64_t pop_attempts = 0;
@@ -632,7 +649,7 @@ index 0246f83..f757fdc 100644
      fprintf(stderr, "[UB search worker=%u] starting\n", worker);
      while (!stop.stop_requested()) {
        // Drain RPC distance completion queues for this search worker.
-@@ -2118,7 +2404,17 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2118,7 +2407,17 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          auto lifecycle = ctx->rpc_distance->ProgressSearch(
              worker, 64, std::chrono::steady_clock::now());
          if (!lifecycle.ok()) {
@@ -651,7 +668,7 @@ index 0246f83..f757fdc 100644
          }
        }
        // Drain this search worker's own deferred-ready ring. Mixed local +
-@@ -2140,7 +2436,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2140,7 +2439,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          std::this_thread::sleep_for(std::chrono::microseconds(200));
          continue;
        }
@@ -660,7 +677,7 @@ index 0246f83..f757fdc 100644
                worker, runnable->query.query_slot,
                static_cast<int>(runnable->source));
        if (runnable->query.query_slot >= ctx->slot_records.size()) {
-@@ -2210,7 +2506,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2210,7 +2509,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
                    record.pickup_ts - record.last_yield_ts).count();
          }
        }
@@ -669,7 +686,7 @@ index 0246f83..f757fdc 100644
                worker, runnable->query.query_slot);
        ctx->loads->Publish(worker,
                            {ctx->queues->input_backlog(worker), true});
-@@ -2221,7 +2517,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2221,7 +2520,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          const auto step = task->Step();
          const auto step_end_ts = std::chrono::steady_clock::now();
          if (step_count < 5 || (step_count % 100) == 0) {
@@ -678,7 +695,7 @@ index 0246f83..f757fdc 100644
                    worker, runnable->query.query_slot,
                    static_cast<int>(step),
                    static_cast<int>(task->run_state()),
-@@ -2338,9 +2634,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2338,9 +2637,23 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
              static_cast<const void*>(ctx->local_shard_for_rpc));
      auto& server = *ctx->rpc_server;
      const LocalShard& local_shard = *ctx->local_shard_for_rpc;
@@ -703,7 +720,7 @@ index 0246f83..f757fdc 100644
        auto slot_opt = server.PopService(worker);
        if (!slot_opt.has_value()) {
          std::this_thread::sleep_for(std::chrono::microseconds(20));
-@@ -2355,10 +2665,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2355,10 +2668,26 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        if (!compute_status.ok()) {
          auto pub = server.PublishResult(
              worker, slot, compute_status.code());
@@ -732,7 +749,7 @@ index 0246f83..f757fdc 100644
        }
      }
      return Status::Ok();
-@@ -2455,6 +2781,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2455,6 +2784,7 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
      }
      auto last_hb = std::chrono::steady_clock::now();
      std::uint64_t last_submitted = 0, last_completed = 0;
@@ -740,7 +757,7 @@ index 0246f83..f757fdc 100644
      auto last_activity = std::chrono::steady_clock::now();
      const auto spin_budget =
          std::chrono::microseconds(cfg->read_progress_spin_us);
-@@ -2466,6 +2793,19 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2466,6 +2796,19 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
        const auto activity_after =
            ReadActivityValue(ctx->dispatchers[thread]->profile());
        const auto iteration_finished = std::chrono::steady_clock::now();
@@ -760,7 +777,7 @@ index 0246f83..f757fdc 100644
        const auto hb_now2 = std::chrono::steady_clock::now();
        if (hb_now2 - last_hb > std::chrono::seconds(2)) {
          const auto& prof = ctx->dispatchers[thread]->profile();
-@@ -2481,9 +2821,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
+@@ -2481,9 +2824,6 @@ Status MilvusUbRuntime::EnableDistributedSearchLocked() {
          last_hb = hb_now2;
        }
        (void)ctx->ready_publisher->Flush(thread, cfg->search_workers);
